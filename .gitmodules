@@ -1,0 +1,12 @@
+[submodule "vendor/libpng"]
+	path = vendor/libpng
+	url = https://github.com/pnggroup/libpng
+[submodule "vendor/libimagequant"]
+	path = vendor/libimagequant
+	url = https://github.com/imageoptim/libimagequant.git
+[submodule "vendor/zlib"]
+	path = vendor/zlib
+	url = https://github.com/madler/zlib
+[submodule "vendor/zopfli"]
+	path = vendor/zopfli
+	url = https://github.com/google/zopfli

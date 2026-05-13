@@ -1,33 +1,44 @@
 #include "7z.h"
 
-#include "DeflateEncoder.h"
-#include "DeflateDecoder.h"
+#include "../vendor/7z2601/CPP/Common/MyInitGuid.h"
+#include "../vendor/7z2601/CPP/7zip/Compress/DeflateEncoder.h"
+#include "../vendor/7z2601/CPP/7zip/Compress/DeflateDecoder.h"
+#include "../vendor/7z2601/CPP/7zip/Common/StreamObjects.h"
 
 #include "zlib.h"
 
 bool compress_deflate_7z(const unsigned char* in_data, unsigned in_size, unsigned char* out_data, unsigned& out_size, unsigned num_passes, unsigned num_fast_bytes) throw ()
 {
 	try {
-		NDeflate::NEncoder::CCoder cc;
+		NCompress::NDeflate::NEncoder::CCoder cc;
 
-		if (cc.SetEncoderNumPasses(num_passes) != S_OK)
+		const PROPID prop_ids[2] = {
+			NCoderPropID::kNumPasses,
+			NCoderPropID::kNumFastBytes
+		};
+		PROPVARIANT props[2];
+		memset(props, 0, sizeof(props));
+		props[0].vt = VT_UI4;
+		props[0].ulVal = num_passes;
+		props[1].vt = VT_UI4;
+		props[1].ulVal = num_fast_bytes;
+		if (cc.BaseSetEncoderProperties2(prop_ids, props, 2) != S_OK)
 			return false;
 
-		if (cc.SetEncoderNumFastBytes(num_fast_bytes) != S_OK)
-			return false;
-
-		ISequentialInStream in(reinterpret_cast<const char*>(in_data), in_size);
-		ISequentialOutStream out(reinterpret_cast<char*>(out_data), out_size);
+		CBufInStream in;
+		in.Init(in_data, in_size);
+		CBufPtrSeqOutStream out;
+		out.Init(out_data, out_size);
 
 		UINT64 in_size_l = in_size;
-
-		if (cc.Code(&in, &out, &in_size_l) != S_OK)
+		if (cc.BaseCode(&in, &out, &in_size_l, 0, 0) != S_OK)
+			return false;
+		if (!in.WasFinished())
+			return false;
+		if (out.GetPos() > out_size)
 			return false;
 
-		out_size = out.size_get();
-
-		if (out.overflow_get())
-			return false;
+		out_size = static_cast<unsigned>(out.GetPos());
 
 		return true;
 	} catch (...) {
@@ -37,18 +48,20 @@ bool compress_deflate_7z(const unsigned char* in_data, unsigned in_size, unsigne
 
 bool decompress_deflate_7z(const unsigned char* in_data, unsigned in_size, unsigned char* out_data, unsigned out_size) throw () {
 	try {
-		NDeflate::NDecoder::CCoder cc;
-
-		ISequentialInStream in(reinterpret_cast<const char*>(in_data), in_size);
-		ISequentialOutStream out(reinterpret_cast<char*>(out_data), out_size);
+		NCompress::NDeflate::NDecoder::CCOMCoder cc;
+		CBufInStream in;
+		in.Init(in_data, in_size);
+		CBufPtrSeqOutStream out;
+		out.Init(out_data, out_size);
 
 		UINT64 in_size_l = in_size;
 		UINT64 out_size_l = out_size;
 
-		if (cc.Code(&in, &out, &in_size_l, &out_size_l) != S_OK)
+		ICompressCoder* coder = &cc;
+		if (coder->Code(&in, &out, &in_size_l, &out_size_l, 0) != S_OK)
 			return false;
 
-		if (out.size_get() != out_size || out.overflow_get())
+		if (out.GetPos() != out_size)
 			return false;
 
 		return true;

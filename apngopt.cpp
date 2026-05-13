@@ -728,60 +728,92 @@ void optim_downconvert(std::vector<APNGFrame>& frames, unsigned int & coltype)
 void optim_image(std::vector<APNGFrame>& frames, unsigned int & coltype, int minQuality, int maxQuality)
 {
     unsigned int size = frames.size();
+    if (size == 0)
+      return;
+
     unsigned int width = frames[0].w;
     unsigned int height = frames[0].h;
     unsigned int imageSize = width * height * 4;
+
     liq_attr *attr = liq_attr_create();
-    liq_set_quality(attr, minQuality, maxQuality);
-    liq_histogram *hist = liq_histogram_create(attr);
-    unsigned char *pixels[size];
-    liq_image *images[size];
-	
-    for (int i = 0; i < size; i++)
+    if (!attr)
+      return;
+
+    if (liq_set_quality(attr, minQuality, maxQuality) != LIQ_OK)
     {
-        unsigned char *raw_rgba_pixels = (unsigned char *)malloc(imageSize);
-        memcpy(raw_rgba_pixels, frames[i].p, imageSize);
-
-        liq_image *image = liq_image_create_rgba(attr, raw_rgba_pixels, width, height, 0);
-        liq_histogram_add_image(hist, attr, image);
-
-        pixels[i] = raw_rgba_pixels;
-        images[i] = image;
-        /*process_callback(0.3 + i / float(size) * 0.1);*/
+      liq_attr_destroy(attr);
+      return;
     }
 
-    liq_result *res;
-    coltype = 3;
-    int errorCode = liq_histogram_quantize(hist, attr, &res);
-    if (errorCode == LIQ_OK)
+    liq_histogram *hist = liq_histogram_create(attr);
+    if (!hist)
     {
-        for (int i = 0; i < size; i++)
+      liq_attr_destroy(attr);
+      return;
+    }
+
+    std::vector<liq_image*> images(size, NULL);
+    bool ok = true;
+
+    for (unsigned int i = 0; i < size; i++)
+    {
+      liq_image *image = liq_image_create_rgba(attr, frames[i].p, width, height, 0);
+      if (!image || liq_histogram_add_image(hist, attr, image) != LIQ_OK)
+      {
+        if (image)
+          liq_image_destroy(image);
+        ok = false;
+        break;
+      }
+
+      images[i] = image;
+      /*process_callback(0.3 + i / float(size) * 0.1);*/
+    }
+
+    if (ok)
+    {
+      liq_result *res = NULL;
+      coltype = 3;
+      if (liq_histogram_quantize(hist, attr, &res) == LIQ_OK && res)
+      {
+        for (unsigned int i = 0; i < size; i++)
         {
-            liq_write_remapped_image(res, images[i], frames[i].p, imageSize);
+          if (liq_write_remapped_image(res, images[i], frames[i].p, imageSize) != LIQ_OK)
+          {
+            ok = false;
+            break;
+          }
         }
-        const liq_palette *liqPalette = liq_get_palette(res);
-        palsize = liqPalette->count;
-        for (size_t i = 0; i < liqPalette->count; i++)
+
+        if (ok)
         {
+          const liq_palette *liqPalette = liq_get_palette(res);
+          palsize = liqPalette->count;
+          trnssize = 0;
+          for (unsigned int i = 0; i < liqPalette->count; i++)
+          {
             palette[i].r = liqPalette->entries[i].r;
             palette[i].g = liqPalette->entries[i].g;
             palette[i].b = liqPalette->entries[i].b;
             trns[i] = liqPalette->entries[i].a;
             if (trns[i] != 255)
-                trnssize = i + 1;
-            
+              trnssize = i + 1;
+
             /*process_callback(0.4 + i / float(palsize) * 0.1);*/
+          }
         }
+      }
+
+      if (res)
+        liq_result_destroy(res);
     }
 
-    for (int i = 0; i < size; i++)
-    {
-        delete[] pixels[i];
+    for (unsigned int i = 0; i < size; i++)
+      if (images[i])
         liq_image_destroy(images[i]);
-    }
-    liq_result_destroy(res);
-    liq_attr_destroy(attr);
+
     liq_histogram_destroy(hist);
+    liq_attr_destroy(attr);
 }
 void write_chunk(FILE * f, const char * name, unsigned char * data, unsigned int length)
 {
@@ -1501,7 +1533,7 @@ int main(int argc, char** argv)
            "-z1  : 7zip compression \n"
            "-z2  : zopfli compression\n"
            "-i## : number of iterations, default -i%d\n"
-		   "-d## : disable imagequant compress 0 or 1, default 0 -d%d\n", iter);
+		   "-d## : disable imagequant compress 0 or 1, default 0 -d%d\n", iter, disableImageQuant);
     return 1;
   }
 

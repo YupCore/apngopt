@@ -32,3 +32,6 @@
 *.app
 
 .history
+build/
+build-*/
+out/
