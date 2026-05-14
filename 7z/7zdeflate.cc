@@ -30,7 +30,7 @@ bool compress_deflate_7z(const unsigned char* in_data, unsigned in_size, unsigne
 		CBufPtrSeqOutStream out;
 		out.Init(out_data, out_size);
 
-		UINT64 in_size_l = in_size;
+		UInt64 in_size_l = in_size;
 		if (cc.BaseCode(&in, &out, &in_size_l, 0, 0) != S_OK)
 			return false;
 		if (!in.WasFinished())
@@ -54,8 +54,8 @@ bool decompress_deflate_7z(const unsigned char* in_data, unsigned in_size, unsig
 		CBufPtrSeqOutStream out;
 		out.Init(out_data, out_size);
 
-		UINT64 in_size_l = in_size;
-		UINT64 out_size_l = out_size;
+		UInt64 in_size_l = in_size;
+		UInt64 out_size_l = out_size;
 
 		ICompressCoder* coder = &cc;
 		if (coder->Code(&in, &out, &in_size_l, &out_size_l, 0) != S_OK)

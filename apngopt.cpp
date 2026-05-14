@@ -38,7 +38,9 @@
 #include "png.h"     /* original (unpatched) libpng is ok */
 #include "zlib.h"
 #include "7z.h"
+#ifndef APNGOPT_NO_IMAGEQUANT
 #include "libimagequant.h"
+#endif
 extern "C" {
 #include "zopfli.h"
 }
@@ -886,6 +888,7 @@ void optim_downconvert(std::vector<APNGFrame>& frames, unsigned int & coltype)
     }
   }
 }
+#ifndef APNGOPT_NO_IMAGEQUANT
 static bool apply_imagequant_options(liq_attr *attr, int minQuality, int maxQuality, int liqSpeed, int liqMaxColors, int liqPosterization)
 {
   if (!attr)
@@ -1064,6 +1067,13 @@ bool optim_image(std::vector<APNGFrame>& frames, unsigned int & coltype, int min
     liq_attr_destroy(attr);
     return ok;
 }
+#else
+bool optim_image(std::vector<APNGFrame>& /*frames*/, unsigned int & /*coltype*/, int /*minQuality*/, int /*maxQuality*/, int /*liqSpeed*/, int /*liqMaxColors*/, int /*liqPosterization*/, float /*liqDither*/)
+{
+  return false;
+}
+#endif
+
 bool write_chunk(FILE * f, const char * name, unsigned char * data, unsigned int length)
 {
   if (!f || !name)

@@ -97,10 +97,10 @@ target_link_libraries(apngopt_7z_deflate PUBLIC ZLIB::ZLIB)
 
 if(NOT MSVC)
   target_compile_options(apngopt_7z_deflate PRIVATE
-    -Wno-sign-compare
-    -Wno-reorder
-    -Wno-maybe-uninitialized
-    -Wno-parentheses
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-sign-compare>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-reorder>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-maybe-uninitialized>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-parentheses>
   )
 endif()
 
@@ -143,7 +143,7 @@ if(APNGOPT_ENABLE_IMAGEQUANT)
 endif()
 
 add_executable(apngopt apngopt.cpp)
-target_include_directories(apngopt PRIVATE 7z vendor/libimagequant/imagequant-sys)
+target_include_directories(apngopt PRIVATE 7z)
 target_link_libraries(apngopt PRIVATE
   PNG::PNG
   ZLIB::ZLIB
@@ -152,7 +152,10 @@ target_link_libraries(apngopt PRIVATE
 )
 
 if(APNGOPT_ENABLE_IMAGEQUANT)
+  target_include_directories(apngopt PRIVATE vendor/libimagequant/imagequant-sys)
   target_link_libraries(apngopt PRIVATE imagequant_sys)
+else()
+  target_compile_definitions(apngopt PRIVATE APNGOPT_NO_IMAGEQUANT)
 endif()
 
 if(WIN32)

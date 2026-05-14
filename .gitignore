@@ -32,6 +32,12 @@
 *.app
 
 .history
+
+# CMake/build output
 build/
 build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
 out/

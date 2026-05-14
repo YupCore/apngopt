@@ -1,0 +1,70 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-msvc-release",
+      "displayName": "Windows MSVC Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-msvc-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "APNGOPT_ENABLE_IMAGEQUANT": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "linux-release-no-imagequant",
+      "displayName": "Linux Release (no imagequant, no Cargo needed)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-release-no-imagequant",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "APNGOPT_ENABLE_IMAGEQUANT": "OFF"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "linux-release-imagequant",
+      "displayName": "Linux Release (with imagequant)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-release-imagequant",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "APNGOPT_ENABLE_IMAGEQUANT": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-msvc-release",
+      "configurePreset": "windows-msvc-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "linux-release-no-imagequant",
+      "configurePreset": "linux-release-no-imagequant"
+    },
+    {
+      "name": "linux-release-imagequant",
+      "configurePreset": "linux-release-imagequant"
+    }
+  ]
+}
