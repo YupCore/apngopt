@@ -213,7 +213,10 @@ int processing_start(png_structp & png_ptr, png_infop & info_ptr, void * frame_p
     return 1;
   info_ptr = png_create_info_struct(png_ptr);
   if (!info_ptr)
+  {
+    png_destroy_read_struct(&png_ptr, 0, 0);
     return 1;
+  }
 
   if (setjmp(png_jmpbuf(png_ptr)))
   {
@@ -1021,36 +1024,44 @@ bool optim_image(std::vector<APNGFrame>& frames, unsigned int & coltype, int min
     liq_attr_destroy(attr);
     return ok;
 }
-void write_chunk(FILE * f, const char * name, unsigned char * data, unsigned int length)
+bool write_chunk(FILE * f, const char * name, unsigned char * data, unsigned int length)
 {
+  if (!f || !name)
+    return false;
+
   unsigned char buf[4];
   unsigned int crc = crc32(0, Z_NULL, 0);
 
   png_save_uint_32(buf, length);
-  fwrite(buf, 1, 4, f);
-  fwrite(name, 1, 4, f);
+  if (fwrite(buf, 1, 4, f) != 4) return false;
+  if (fwrite(name, 1, 4, f) != 4) return false;
   crc = crc32(crc, (const Bytef *)name, 4);
 
   if (memcmp(name, "fdAT", 4) == 0)
   {
+    if (length < 4)
+      return false;
     png_save_uint_32(buf, next_seq_num++);
-    fwrite(buf, 1, 4, f);
+    if (fwrite(buf, 1, 4, f) != 4) return false;
     crc = crc32(crc, buf, 4);
     length -= 4;
   }
 
   if (data != NULL && length > 0)
   {
-    fwrite(data, 1, length, f);
+    if (fwrite(data, 1, length, f) != length) return false;
     crc = crc32(crc, data, length);
   }
 
   png_save_uint_32(buf, crc);
-  fwrite(buf, 1, 4, f);
+  if (fwrite(buf, 1, 4, f) != 4) return false;
+  return true;
 }
 
-void write_IDATs(FILE * f, int frame, unsigned char * data, unsigned int length, unsigned int idat_size)
+bool write_IDATs(FILE * f, int frame, unsigned char * data, unsigned int length, unsigned int idat_size)
 {
+  if (!f || !data || length == 0)
+    return false;
   unsigned int z_cmf = data[0];
   if ((z_cmf & 0x0f) == 8 && (z_cmf & 0xf0) <= 0x70)
   {
@@ -1080,13 +1091,18 @@ void write_IDATs(FILE * f, int frame, unsigned char * data, unsigned int length,
       ds = 32768;
 
     if (frame == 0)
-      write_chunk(f, "IDAT", data, ds);
+    {
+      if (!write_chunk(f, "IDAT", data, ds)) return false;
+    }
     else
-      write_chunk(f, "fdAT", data, ds+4);
+    {
+      if (!write_chunk(f, "fdAT", data, ds+4)) return false;
+    }
 
     data += ds;
     length -= ds;
   }
+  return true;
 }
 
 void process_rect(unsigned char * row, int rowbytes, int bpp, int stride, int h, unsigned char * rows)
@@ -1567,18 +1583,64 @@ int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int f
       return 1;
     }
 
-    write_chunk(f, "IHDR", buf_IHDR, 13);
+    if (!write_chunk(f, "IHDR", buf_IHDR, 13))
+    {
+      fclose(f);
+      delete[] temp;
+      delete[] over1;
+      delete[] over2;
+      delete[] over3;
+      delete[] rest;
+      delete[] rows;
+      return 1;
+    }
 
     if (num_frames > 1)
-      write_chunk(f, "acTL", buf_acTL, 8);
+    {
+      if (!write_chunk(f, "acTL", buf_acTL, 8))
+      {
+        fclose(f);
+        delete[] temp;
+        delete[] over1;
+        delete[] over2;
+        delete[] over3;
+        delete[] rest;
+        delete[] rows;
+        return 1;
+      }
+    }
     else
       first = 0;
 
     if (palsize > 0)
-      write_chunk(f, "PLTE", (unsigned char *)(&palette), palsize*3);
+    {
+      if (!write_chunk(f, "PLTE", (unsigned char *)(&palette), palsize*3))
+      {
+        fclose(f);
+        delete[] temp;
+        delete[] over1;
+        delete[] over2;
+        delete[] over3;
+        delete[] rest;
+        delete[] rows;
+        return 1;
+      }
+    }
 
     if (trnssize > 0)
-      write_chunk(f, "tRNS", trns, trnssize);
+    {
+      if (!write_chunk(f, "tRNS", trns, trnssize))
+      {
+        fclose(f);
+        delete[] temp;
+        delete[] over1;
+        delete[] over2;
+        delete[] over3;
+        delete[] rest;
+        delete[] rows;
+        return 1;
+      }
+    }
 
     op_zstream1.data_type = Z_BINARY;
     op_zstream1.zalloc = Z_NULL;
@@ -1666,7 +1728,27 @@ int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int f
 
     if (first)
     {
-      write_IDATs(f, 0, zbuf, zsize, idat_size);
+      if (!write_IDATs(f, 0, zbuf, zsize, idat_size))
+      {
+        fclose(f);
+        delete[] zbuf;
+        delete[] op_zbuf1;
+        delete[] op_zbuf2;
+        delete[] row_buf;
+        delete[] sub_row;
+        delete[] up_row;
+        delete[] avg_row;
+        delete[] paeth_row;
+        deflateEnd(&op_zstream1);
+        deflateEnd(&op_zstream2);
+        delete[] temp;
+        delete[] over1;
+        delete[] over2;
+        delete[] over3;
+        delete[] rest;
+        delete[] rows;
+        return 1;
+      }
 
       printf("saving %s (frame %d of %d)\n", szOut, 1, num_frames-first);
       for (j=0; j<6; j++)
@@ -1749,9 +1831,49 @@ int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int f
       png_save_uint_16(buf_fcTL + 22, frames[i].delay_den);
       buf_fcTL[24] = dop;
       buf_fcTL[25] = bop;
-      write_chunk(f, "fcTL", buf_fcTL, 26);
+      if (!write_chunk(f, "fcTL", buf_fcTL, 26))
+      {
+        fclose(f);
+        delete[] zbuf;
+        delete[] op_zbuf1;
+        delete[] op_zbuf2;
+        delete[] row_buf;
+        delete[] sub_row;
+        delete[] up_row;
+        delete[] avg_row;
+        delete[] paeth_row;
+        deflateEnd(&op_zstream1);
+        deflateEnd(&op_zstream2);
+        delete[] temp;
+        delete[] over1;
+        delete[] over2;
+        delete[] over3;
+        delete[] rest;
+        delete[] rows;
+        return 1;
+      }
 
-      write_IDATs(f, i, zbuf, zsize, idat_size);
+      if (!write_IDATs(f, i, zbuf, zsize, idat_size))
+      {
+        fclose(f);
+        delete[] zbuf;
+        delete[] op_zbuf1;
+        delete[] op_zbuf2;
+        delete[] row_buf;
+        delete[] sub_row;
+        delete[] up_row;
+        delete[] avg_row;
+        delete[] paeth_row;
+        deflateEnd(&op_zstream1);
+        deflateEnd(&op_zstream2);
+        delete[] temp;
+        delete[] over1;
+        delete[] over2;
+        delete[] over3;
+        delete[] rest;
+        delete[] rows;
+        return 1;
+      }
 
       /* process apng dispose - begin */
       if (dop != 2)
@@ -1809,13 +1931,92 @@ int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int f
       png_save_uint_16(buf_fcTL + 22, frames[num_frames-1].delay_den);
       buf_fcTL[24] = 0;
       buf_fcTL[25] = bop;
-      write_chunk(f, "fcTL", buf_fcTL, 26);
+      if (!write_chunk(f, "fcTL", buf_fcTL, 26))
+      {
+        fclose(f);
+        delete[] zbuf;
+        delete[] op_zbuf1;
+        delete[] op_zbuf2;
+        delete[] row_buf;
+        delete[] sub_row;
+        delete[] up_row;
+        delete[] avg_row;
+        delete[] paeth_row;
+        deflateEnd(&op_zstream1);
+        deflateEnd(&op_zstream2);
+        delete[] temp;
+        delete[] over1;
+        delete[] over2;
+        delete[] over3;
+        delete[] rest;
+        delete[] rows;
+        return 1;
+      }
     }
 
-    write_IDATs(f, num_frames-1, zbuf, zsize, idat_size);
+    if (!write_IDATs(f, num_frames-1, zbuf, zsize, idat_size))
+    {
+      fclose(f);
+      delete[] zbuf;
+      delete[] op_zbuf1;
+      delete[] op_zbuf2;
+      delete[] row_buf;
+      delete[] sub_row;
+      delete[] up_row;
+      delete[] avg_row;
+      delete[] paeth_row;
+      deflateEnd(&op_zstream1);
+      deflateEnd(&op_zstream2);
+      delete[] temp;
+      delete[] over1;
+      delete[] over2;
+      delete[] over3;
+      delete[] rest;
+      delete[] rows;
+      return 1;
+    }
 
-    write_chunk(f, "IEND", 0, 0);
-    fclose(f);
+    if (!write_chunk(f, "IEND", 0, 0))
+    {
+      fclose(f);
+      delete[] zbuf;
+      delete[] op_zbuf1;
+      delete[] op_zbuf2;
+      delete[] row_buf;
+      delete[] sub_row;
+      delete[] up_row;
+      delete[] avg_row;
+      delete[] paeth_row;
+      deflateEnd(&op_zstream1);
+      deflateEnd(&op_zstream2);
+      delete[] temp;
+      delete[] over1;
+      delete[] over2;
+      delete[] over3;
+      delete[] rest;
+      delete[] rows;
+      return 1;
+    }
+    if (fclose(f) != 0)
+    {
+      delete[] zbuf;
+      delete[] op_zbuf1;
+      delete[] op_zbuf2;
+      delete[] row_buf;
+      delete[] sub_row;
+      delete[] up_row;
+      delete[] avg_row;
+      delete[] paeth_row;
+      deflateEnd(&op_zstream1);
+      deflateEnd(&op_zstream2);
+      delete[] temp;
+      delete[] over1;
+      delete[] over2;
+      delete[] over3;
+      delete[] rest;
+      delete[] rows;
+      return 1;
+    }
 
     delete[] zbuf;
     delete[] op_zbuf1;

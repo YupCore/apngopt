@@ -14,6 +14,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(APNGOPT_ENABLE_IMAGEQUANT "Build and link vendored libimagequant via Cargo" ON)
+option(APNGOPT_ZLIB_LIT_MEM "Enable zlib LIT_MEM for slight deflate speedup" ON)
 
 set(ZLIB_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(ZLIB_BUILD_SHARED OFF CACHE BOOL "" FORCE)
@@ -21,6 +22,15 @@ set(ZLIB_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(ZLIB_INSTALL OFF CACHE BOOL "" FORCE)
 set(ZLIB_CONF_WRITTEN FALSE CACHE BOOL "" FORCE)
 add_subdirectory(vendor/zlib EXCLUDE_FROM_ALL)
+
+if(APNGOPT_ZLIB_LIT_MEM)
+  if(TARGET zlibstatic)
+    target_compile_definitions(zlibstatic PRIVATE LIT_MEM)
+  endif()
+  if(TARGET zlib)
+    target_compile_definitions(zlib PRIVATE LIT_MEM)
+  endif()
+endif()
 
 if(TARGET zlibstatic AND NOT TARGET ZLIB::ZLIB)
   add_library(ZLIB::ZLIB ALIAS zlibstatic)
