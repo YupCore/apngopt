@@ -55,19 +55,59 @@ extern "C" {
 struct CHUNK { unsigned char * p; unsigned int size; };
 struct APNGFrame { unsigned char * p, ** rows; unsigned int w, h, delay_num, delay_den; };
 struct COLORS { unsigned int num; unsigned char r, g, b, a; };
-struct OP { unsigned char * p; unsigned int size; int x, y, w, h, valid, filters; };
 struct rgb { unsigned char r, g, b; };
 
-unsigned char * op_zbuf1;
-unsigned char * op_zbuf2;
-z_stream        op_zstream1;
-z_stream        op_zstream2;
-unsigned char * row_buf;
-unsigned char * sub_row;
-unsigned char * up_row;
-unsigned char * avg_row;
-unsigned char * paeth_row;
-OP              op[6];
+enum ExactCandidatesMode
+{
+  kExactCandidatesOff = 0,
+  kExactCandidatesOn = 1
+};
+
+struct ZlibFinalOptions
+{
+  int level;
+  int memLevel;
+  int strategy;
+  int mode;
+  int hasLevel;
+  int hasMemLevel;
+  int hasStrategy;
+  int hasMode;
+};
+
+struct EvalScratch
+{
+  z_stream zs_default;
+  z_stream zs_filtered;
+  unsigned char * zbuf_default;
+  unsigned char * zbuf_filtered;
+  unsigned char * row_buf;
+  unsigned char * sub_row;
+  unsigned char * up_row;
+  unsigned char * avg_row;
+  unsigned char * paeth_row;
+  unsigned char * exact_rows;
+  unsigned char * exact_zbuf;
+  unsigned int zbuf_size;
+  unsigned int rowbytes;
+  size_t rowsbuf_size;
+};
+
+struct CandidateEval
+{
+  unsigned char * p;
+  unsigned int estimate_size;
+  unsigned int exact_size;
+  int x;
+  int y;
+  int w;
+  int h;
+  int op_id;
+  int filters;
+  int valid;
+  int exact_valid;
+};
+
 rgb             palette[256];
 unsigned char   trns[256];
 unsigned int    palsize, trnssize;
@@ -1105,7 +1145,107 @@ bool write_IDATs(FILE * f, int frame, unsigned char * data, unsigned int length,
   return true;
 }
 
-void process_rect(unsigned char * row, int rowbytes, int bpp, int stride, int h, unsigned char * rows)
+bool init_eval_scratch(EvalScratch& scratch, unsigned int rowbytes, unsigned int zbuf_size, size_t rowsbuf_size, int need_exact)
+{
+  memset(&scratch, 0, sizeof(EvalScratch));
+  scratch.rowbytes = rowbytes;
+  scratch.zbuf_size = zbuf_size;
+  scratch.rowsbuf_size = rowsbuf_size;
+
+  scratch.zbuf_default = new unsigned char[zbuf_size];
+  scratch.zbuf_filtered = new unsigned char[zbuf_size];
+  scratch.row_buf = new unsigned char[rowbytes + 1];
+  scratch.sub_row = new unsigned char[rowbytes + 1];
+  scratch.up_row = new unsigned char[rowbytes + 1];
+  scratch.avg_row = new unsigned char[rowbytes + 1];
+  scratch.paeth_row = new unsigned char[rowbytes + 1];
+  if (!scratch.zbuf_default || !scratch.zbuf_filtered || !scratch.row_buf || !scratch.sub_row || !scratch.up_row || !scratch.avg_row || !scratch.paeth_row)
+    return false;
+
+  if (need_exact)
+  {
+    scratch.exact_rows = new unsigned char[rowsbuf_size];
+    scratch.exact_zbuf = new unsigned char[zbuf_size];
+    if (!scratch.exact_rows || !scratch.exact_zbuf)
+      return false;
+  }
+
+  scratch.row_buf[0] = 0;
+  scratch.sub_row[0] = 1;
+  scratch.up_row[0] = 2;
+  scratch.avg_row[0] = 3;
+  scratch.paeth_row[0] = 4;
+
+  scratch.zs_default.data_type = Z_BINARY;
+  scratch.zs_default.zalloc = Z_NULL;
+  scratch.zs_default.zfree = Z_NULL;
+  scratch.zs_default.opaque = Z_NULL;
+  if (deflateInit2(&scratch.zs_default, Z_BEST_SPEED+1, 8, 15, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+    return false;
+
+  scratch.zs_filtered.data_type = Z_BINARY;
+  scratch.zs_filtered.zalloc = Z_NULL;
+  scratch.zs_filtered.zfree = Z_NULL;
+  scratch.zs_filtered.opaque = Z_NULL;
+  if (deflateInit2(&scratch.zs_filtered, Z_BEST_SPEED+1, 8, 15, 8, Z_FILTERED) != Z_OK)
+    return false;
+
+  return true;
+}
+
+void free_eval_scratch(EvalScratch& scratch)
+{
+  if (scratch.zs_default.state)
+    deflateEnd(&scratch.zs_default);
+  if (scratch.zs_filtered.state)
+    deflateEnd(&scratch.zs_filtered);
+
+  delete[] scratch.zbuf_default;
+  delete[] scratch.zbuf_filtered;
+  delete[] scratch.row_buf;
+  delete[] scratch.sub_row;
+  delete[] scratch.up_row;
+  delete[] scratch.avg_row;
+  delete[] scratch.paeth_row;
+  delete[] scratch.exact_rows;
+  delete[] scratch.exact_zbuf;
+  memset(&scratch, 0, sizeof(EvalScratch));
+}
+
+template <typename Fn>
+void run_parallel_indices(unsigned int count, unsigned int threads, Fn fn)
+{
+  if (count == 0)
+    return;
+  if (threads <= 1 || count == 1)
+  {
+    fn(0, count, 0);
+    return;
+  }
+
+  if (threads > count)
+    threads = count;
+  if (threads < 1)
+    threads = 1;
+
+  const unsigned int chunk = (count + threads - 1) / threads;
+  std::vector<std::thread> workers;
+  workers.reserve(threads);
+  for (unsigned int t = 0; t < threads; t++)
+  {
+    const unsigned int begin = t * chunk;
+    unsigned int end = begin + chunk;
+    if (begin >= count)
+      break;
+    if (end > count)
+      end = count;
+    workers.emplace_back([begin, end, t, &fn]() { fn(begin, end, t); });
+  }
+  for (unsigned int t = 0; t < workers.size(); t++)
+    workers[t].join();
+}
+
+bool process_rect_with_scratch(EvalScratch& scratch, unsigned char * row, int rowbytes, int bpp, int stride, int h, unsigned char * rows)
 {
   int i, j, v;
   int a, b, c, pa, pb, pc, p;
@@ -1116,10 +1256,10 @@ void process_rect(unsigned char * row, int rowbytes, int bpp, int stride, int h,
   for (j=0; j<h; j++)
   {
     unsigned int    sum = 0;
-    unsigned char * best_row = row_buf;
+    unsigned char * best_row = scratch.row_buf;
     unsigned int    mins = ((unsigned int)(-1)) >> 1;
 
-    out = row_buf+1;
+    out = scratch.row_buf+1;
     for (i=0; i<rowbytes; i++)
     {
       v = out[i] = row[i];
@@ -1128,7 +1268,7 @@ void process_rect(unsigned char * row, int rowbytes, int bpp, int stride, int h,
     mins = sum;
 
     sum = 0;
-    out = sub_row+1;
+    out = scratch.sub_row+1;
     for (i=0; i<bpp; i++)
     {
       v = out[i] = row[i];
@@ -1143,13 +1283,13 @@ void process_rect(unsigned char * row, int rowbytes, int bpp, int stride, int h,
     if (sum < mins)
     {
       mins = sum;
-      best_row = sub_row;
+      best_row = scratch.sub_row;
     }
 
     if (prev)
     {
       sum = 0;
-      out = up_row+1;
+      out = scratch.up_row+1;
       for (i=0; i<rowbytes; i++)
       {
         v = out[i] = row[i] - prev[i];
@@ -1159,11 +1299,11 @@ void process_rect(unsigned char * row, int rowbytes, int bpp, int stride, int h,
       if (sum < mins)
       {
         mins = sum;
-        best_row = up_row;
+        best_row = scratch.up_row;
       }
 
       sum = 0;
-      out = avg_row+1;
+      out = scratch.avg_row+1;
       for (i=0; i<bpp; i++)
       {
         v = out[i] = row[i] - prev[i]/2;
@@ -1178,11 +1318,11 @@ void process_rect(unsigned char * row, int rowbytes, int bpp, int stride, int h,
       if (sum < mins)
       {
         mins = sum;
-        best_row = avg_row;
+        best_row = scratch.avg_row;
       }
 
       sum = 0;
-      out = paeth_row+1;
+      out = scratch.paeth_row+1;
       for (i=0; i<bpp; i++)
       {
         v = out[i] = row[i] - prev[i];
@@ -1204,25 +1344,23 @@ void process_rect(unsigned char * row, int rowbytes, int bpp, int stride, int h,
         if (sum > mins) break;
       }
       if (sum < mins)
-      {
-        best_row = paeth_row;
-      }
+        best_row = scratch.paeth_row;
     }
 
     if (rows == NULL)
     {
-      // deflate_rect_op()
-      op_zstream1.next_in = row_buf;
-      op_zstream1.avail_in = rowbytes + 1;
-      deflate(&op_zstream1, Z_NO_FLUSH);
+      scratch.zs_default.next_in = scratch.row_buf;
+      scratch.zs_default.avail_in = rowbytes + 1;
+      if (deflate(&scratch.zs_default, Z_NO_FLUSH) != Z_OK)
+        return false;
 
-      op_zstream2.next_in = best_row;
-      op_zstream2.avail_in = rowbytes + 1;
-      deflate(&op_zstream2, Z_NO_FLUSH);
+      scratch.zs_filtered.next_in = best_row;
+      scratch.zs_filtered.avail_in = rowbytes + 1;
+      if (deflate(&scratch.zs_filtered, Z_NO_FLUSH) != Z_OK)
+        return false;
     }
     else
     {
-      // deflate_rect_fin()
       memcpy(dp, best_row, rowbytes+1);
       dp += rowbytes+1;
     }
@@ -1230,131 +1368,62 @@ void process_rect(unsigned char * row, int rowbytes, int bpp, int stride, int h,
     prev = row;
     row += stride;
   }
-}
-
-bool deflate_rect_fin(int deflate_method, int iter, unsigned char * zbuf, unsigned int * zsize, int bpp, int stride, unsigned char * rows, int zbuf_size, int n)
-{
-  if (!zbuf || !zsize || !rows || zbuf_size <= 0)
-    return false;
-
-  unsigned char * row  = op[n].p + op[n].y*stride + op[n].x*bpp;
-  int rowbytes = op[n].w*bpp;
-  size_t filtered_size = 0;
-  if (!checked_add_size((size_t)rowbytes, 1, &filtered_size) || !checked_mul_size(filtered_size, (size_t)op[n].h, &filtered_size))
-    return false;
-  if (filtered_size > (size_t)INT_MAX)
-    return false;
-
-  if (op[n].filters == 0)
-  {
-    unsigned char * dp  = rows;
-    for (int j=0; j<op[n].h; j++)
-    {
-      *dp++ = 0;
-      memcpy(dp, row, rowbytes);
-      dp += rowbytes;
-      row += stride;
-    }
-  }
-  else
-    process_rect(row, rowbytes, bpp, stride, op[n].h, rows);
-
-  if (deflate_method == 2)
-  {
-    ZopfliOptions opt_zopfli;
-    unsigned char* data = 0;
-    size_t size = 0;
-    ZopfliInitOptions(&opt_zopfli);
-    opt_zopfli.numiterations = iter;
-    ZopfliCompress(&opt_zopfli, ZOPFLI_FORMAT_ZLIB, rows, filtered_size, &data, &size);
-    if (!data)
-      return false;
-    if (size < (size_t)zbuf_size)
-    {
-      memcpy(zbuf, data, size);
-      *zsize = (unsigned int)size;
-    }
-    else
-    {
-      free(data);
-      return false;
-    }
-    free(data);
-  }
-  else
-  if (deflate_method == 1)
-  {
-    unsigned size = zbuf_size;
-    if (!compress_rfc1950_7z(rows, (unsigned)filtered_size, zbuf, size, iter<100 ? iter : 100, 255))
-      return false;
-    *zsize = size;
-  }
-  else
-  {
-    z_stream fin_zstream;
-
-    fin_zstream.data_type = Z_BINARY;
-    fin_zstream.zalloc = Z_NULL;
-    fin_zstream.zfree = Z_NULL;
-    fin_zstream.opaque = Z_NULL;
-    if (deflateInit2(&fin_zstream, Z_BEST_COMPRESSION, 8, 15, 8, op[n].filters ? Z_FILTERED : Z_DEFAULT_STRATEGY) != Z_OK)
-      return false;
-
-    fin_zstream.next_out = zbuf;
-    fin_zstream.avail_out = zbuf_size;
-    fin_zstream.next_in = rows;
-    fin_zstream.avail_in = (uInt)filtered_size;
-    int zret = deflate(&fin_zstream, Z_FINISH);
-    if (zret != Z_STREAM_END)
-    {
-      deflateEnd(&fin_zstream);
-      return false;
-    }
-    *zsize = fin_zstream.total_out;
-    deflateEnd(&fin_zstream);
-  }
   return true;
 }
 
-void deflate_rect_op(unsigned char *pdata, int x, int y, int w, int h, int bpp, int stride, int zbuf_size, int n)
+bool evaluate_candidate(EvalScratch& scratch, CandidateEval& cand, int bpp, int stride, int zbuf_size)
 {
-  unsigned char * row  = pdata + y*stride + x*bpp;
-  int rowbytes = w * bpp;
+  cand.valid = 0;
+  cand.exact_valid = 0;
 
-  op_zstream1.data_type = Z_BINARY;
-  op_zstream1.next_out = op_zbuf1;
-  op_zstream1.avail_out = zbuf_size;
+  if (cand.w <= 0 || cand.h <= 0)
+    return false;
 
-  op_zstream2.data_type = Z_BINARY;
-  op_zstream2.next_out = op_zbuf2;
-  op_zstream2.avail_out = zbuf_size;
+  unsigned char * row  = cand.p + cand.y*stride + cand.x*bpp;
+  int rowbytes = cand.w * bpp;
+  if (rowbytes < 1)
+    return false;
 
-  process_rect(row, rowbytes, bpp, stride, h, NULL);
+  scratch.zs_default.data_type = Z_BINARY;
+  scratch.zs_default.next_out = scratch.zbuf_default;
+  scratch.zs_default.avail_out = zbuf_size;
+  scratch.zs_filtered.data_type = Z_BINARY;
+  scratch.zs_filtered.next_out = scratch.zbuf_filtered;
+  scratch.zs_filtered.avail_out = zbuf_size;
 
-  deflate(&op_zstream1, Z_FINISH);
-  deflate(&op_zstream2, Z_FINISH);
-  op[n].p = pdata;
-
-  if (op_zstream1.total_out < op_zstream2.total_out)
+  if (!process_rect_with_scratch(scratch, row, rowbytes, bpp, stride, cand.h, NULL))
   {
-    op[n].size = op_zstream1.total_out;
-    op[n].filters = 0;
+    deflateReset(&scratch.zs_default);
+    deflateReset(&scratch.zs_filtered);
+    return false;
+  }
+
+  int z1 = deflate(&scratch.zs_default, Z_FINISH);
+  int z2 = deflate(&scratch.zs_filtered, Z_FINISH);
+  if (z1 != Z_STREAM_END || z2 != Z_STREAM_END)
+  {
+    deflateReset(&scratch.zs_default);
+    deflateReset(&scratch.zs_filtered);
+    return false;
+  }
+
+  if (scratch.zs_default.total_out < scratch.zs_filtered.total_out)
+  {
+    cand.estimate_size = (unsigned int)scratch.zs_default.total_out;
+    cand.filters = 0;
   }
   else
   {
-    op[n].size = op_zstream2.total_out;
-    op[n].filters = 1;
+    cand.estimate_size = (unsigned int)scratch.zs_filtered.total_out;
+    cand.filters = 1;
   }
-  op[n].x = x;
-  op[n].y = y;
-  op[n].w = w;
-  op[n].h = h;
-  op[n].valid = 1;
-  deflateReset(&op_zstream1);
-  deflateReset(&op_zstream2);
+  cand.valid = 1;
+  deflateReset(&scratch.zs_default);
+  deflateReset(&scratch.zs_filtered);
+  return true;
 }
 
-void get_rect(unsigned int w, unsigned int h, unsigned char *pimage1, unsigned char *pimage2, unsigned char *ptemp, unsigned int bpp, unsigned int stride, int zbuf_size, unsigned int has_tcolor, unsigned int tcolor, int n)
+void get_rect_candidates(unsigned int w, unsigned int h, unsigned char *pimage1, unsigned char *pimage2, unsigned char *ptemp, unsigned int bpp, unsigned int stride, unsigned int has_tcolor, unsigned int tcolor, int dispose_code, std::vector<CandidateEval>& out)
 {
   unsigned int   i, j, x0, y0, w0, h0;
   unsigned int   x_min = w-1;
@@ -1490,19 +1559,279 @@ void get_rect(unsigned int w, unsigned int h, unsigned char *pimage1, unsigned c
     h0 = y_max-y_min+1;
   }
 
-  deflate_rect_op(pimage2, x0, y0, w0, h0, bpp, stride, zbuf_size, n*2);
+  CandidateEval c0;
+  memset(&c0, 0, sizeof(CandidateEval));
+  c0.p = pimage2;
+  c0.x = (int)x0;
+  c0.y = (int)y0;
+  c0.w = (int)w0;
+  c0.h = (int)h0;
+  c0.op_id = dispose_code * 2;
+  out.push_back(c0);
 
   if (over_is_possible)
-    deflate_rect_op(ptemp, x0, y0, w0, h0, bpp, stride, zbuf_size, n*2+1);
+  {
+    CandidateEval c1;
+    memset(&c1, 0, sizeof(CandidateEval));
+    c1.p = ptemp;
+    c1.x = (int)x0;
+    c1.y = (int)y0;
+    c1.w = (int)w0;
+    c1.h = (int)h0;
+    c1.op_id = dispose_code * 2 + 1;
+    out.push_back(c1);
+  }
 }
 
-int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int first, unsigned int loops, unsigned int coltype, int deflate_method, int iter)
+bool compress_candidate_exact(EvalScratch& scratch, CandidateEval& cand, int deflate_method, int iter, int bpp, int stride, int zbuf_size)
 {
-  FILE * f;
+  cand.exact_valid = 0;
+  if (deflate_method == 0)
+    return false;
+  if (!cand.valid || !scratch.exact_rows || !scratch.exact_zbuf || cand.w <= 0 || cand.h <= 0)
+    return false;
+
+  unsigned char * row  = cand.p + cand.y*stride + cand.x*bpp;
+  int rowbytes = cand.w * bpp;
+  size_t filtered_size = 0;
+  if (!checked_add_size((size_t)rowbytes, 1, &filtered_size) || !checked_mul_size(filtered_size, (size_t)cand.h, &filtered_size))
+    return false;
+  if (filtered_size > scratch.rowsbuf_size || filtered_size > (size_t)INT_MAX)
+    return false;
+
+  if (cand.filters == 0)
+  {
+    unsigned char * dp = scratch.exact_rows;
+    for (int j=0; j<cand.h; j++)
+    {
+      *dp++ = 0;
+      memcpy(dp, row, rowbytes);
+      dp += rowbytes;
+      row += stride;
+    }
+  }
+  else
+  {
+    if (!process_rect_with_scratch(scratch, row, rowbytes, bpp, stride, cand.h, scratch.exact_rows))
+      return false;
+  }
+
+  if (deflate_method == 2)
+  {
+    ZopfliOptions opt_zopfli;
+    unsigned char* data = 0;
+    size_t size = 0;
+    ZopfliInitOptions(&opt_zopfli);
+    opt_zopfli.numiterations = iter;
+    ZopfliCompress(&opt_zopfli, ZOPFLI_FORMAT_ZLIB, scratch.exact_rows, filtered_size, &data, &size);
+    if (!data)
+      return false;
+    if (size >= (size_t)zbuf_size)
+    {
+      free(data);
+      return false;
+    }
+    cand.exact_size = (unsigned int)size;
+    cand.exact_valid = 1;
+    free(data);
+    return true;
+  }
+  if (deflate_method == 1)
+  {
+    unsigned size = zbuf_size;
+    if (!compress_rfc1950_7z(scratch.exact_rows, (unsigned)filtered_size, scratch.exact_zbuf, size, iter<100 ? iter : 100, 255))
+      return false;
+    cand.exact_size = size;
+    cand.exact_valid = 1;
+    return true;
+  }
+  return false;
+}
+
+int choose_best_candidate(const std::vector<CandidateEval>& candidates, int use_exact)
+{
+  int best = -1;
+  for (unsigned int i=0; i<candidates.size(); i++)
+  {
+    const CandidateEval& c = candidates[i];
+    if (!c.valid)
+      continue;
+    if (use_exact && !c.exact_valid)
+      continue;
+
+    if (best < 0)
+    {
+      best = (int)i;
+      continue;
+    }
+
+    const CandidateEval& b = candidates[best];
+    unsigned int size_c = use_exact ? c.exact_size : c.estimate_size;
+    unsigned int size_b = use_exact ? b.exact_size : b.estimate_size;
+
+    if (size_c != size_b)
+    {
+      if (size_c < size_b)
+        best = (int)i;
+      continue;
+    }
+
+    int dispose_c = c.op_id >> 1;
+    int dispose_b = b.op_id >> 1;
+    if (dispose_c != dispose_b)
+    {
+      if (dispose_c < dispose_b)
+        best = (int)i;
+      continue;
+    }
+
+    int blend_c = c.op_id & 1;
+    int blend_b = b.op_id & 1;
+    if (blend_c != blend_b)
+    {
+      if (blend_c < blend_b)
+        best = (int)i;
+      continue;
+    }
+
+    unsigned long long area_c = (unsigned long long)c.w * (unsigned long long)c.h;
+    unsigned long long area_b = (unsigned long long)b.w * (unsigned long long)b.h;
+    if (area_c != area_b)
+    {
+      if (area_c < area_b)
+        best = (int)i;
+      continue;
+    }
+
+    if (c.op_id < b.op_id)
+      best = (int)i;
+  }
+  return best;
+}
+
+void resolve_zlib_final_options(const ZlibFinalOptions& opts, int use_filtered, int * level, int * memLevel, int * strategy)
+{
+  int l = Z_BEST_COMPRESSION;
+  int m = 8;
+  int s = use_filtered ? Z_FILTERED : Z_DEFAULT_STRATEGY;
+
+  if (opts.hasMode)
+  {
+    if (opts.mode == 0)      { l = 1; m = 8; s = Z_DEFAULT_STRATEGY; }
+    else if (opts.mode == 1) { l = 6; m = 8; s = use_filtered ? Z_FILTERED : Z_DEFAULT_STRATEGY; }
+    else if (opts.mode == 2) { l = 9; m = 9; s = use_filtered ? Z_FILTERED : Z_DEFAULT_STRATEGY; }
+  }
+
+  if (opts.hasLevel)
+    l = opts.level;
+  if (opts.hasMemLevel)
+    m = opts.memLevel;
+  if (opts.hasStrategy)
+    s = opts.strategy;
+
+  *level = l;
+  *memLevel = m;
+  *strategy = s;
+}
+
+bool deflate_rect_fin(EvalScratch& scratch, int deflate_method, int iter, unsigned char * zbuf, unsigned int * zsize, int bpp, int stride, unsigned char * rows, int zbuf_size, const CandidateEval& cand, const ZlibFinalOptions& zlib_opts)
+{
+  if (!zbuf || !zsize || !rows || zbuf_size <= 0 || !cand.valid)
+    return false;
+
+  unsigned char * row  = cand.p + cand.y*stride + cand.x*bpp;
+  int rowbytes = cand.w*bpp;
+  size_t filtered_size = 0;
+  if (!checked_add_size((size_t)rowbytes, 1, &filtered_size) || !checked_mul_size(filtered_size, (size_t)cand.h, &filtered_size))
+    return false;
+  if (filtered_size > (size_t)INT_MAX)
+    return false;
+
+  if (cand.filters == 0)
+  {
+    unsigned char * dp  = rows;
+    for (int j=0; j<cand.h; j++)
+    {
+      *dp++ = 0;
+      memcpy(dp, row, rowbytes);
+      dp += rowbytes;
+      row += stride;
+    }
+  }
+  else
+  {
+    if (!process_rect_with_scratch(scratch, row, rowbytes, bpp, stride, cand.h, rows))
+      return false;
+  }
+
+  if (deflate_method == 2)
+  {
+    ZopfliOptions opt_zopfli;
+    unsigned char* data = 0;
+    size_t size = 0;
+    ZopfliInitOptions(&opt_zopfli);
+    opt_zopfli.numiterations = iter;
+    ZopfliCompress(&opt_zopfli, ZOPFLI_FORMAT_ZLIB, rows, filtered_size, &data, &size);
+    if (!data)
+      return false;
+    if (size < (size_t)zbuf_size)
+    {
+      memcpy(zbuf, data, size);
+      *zsize = (unsigned int)size;
+    }
+    else
+    {
+      free(data);
+      return false;
+    }
+    free(data);
+  }
+  else
+  if (deflate_method == 1)
+  {
+    unsigned size = zbuf_size;
+    if (!compress_rfc1950_7z(rows, (unsigned)filtered_size, zbuf, size, iter<100 ? iter : 100, 255))
+      return false;
+    *zsize = size;
+  }
+  else
+  {
+    z_stream fin_zstream;
+    int level = Z_BEST_COMPRESSION;
+    int memLevel = 8;
+    int strategy = cand.filters ? Z_FILTERED : Z_DEFAULT_STRATEGY;
+    resolve_zlib_final_options(zlib_opts, cand.filters, &level, &memLevel, &strategy);
+
+    fin_zstream.data_type = Z_BINARY;
+    fin_zstream.zalloc = Z_NULL;
+    fin_zstream.zfree = Z_NULL;
+    fin_zstream.opaque = Z_NULL;
+    if (deflateInit2(&fin_zstream, level, 8, 15, memLevel, strategy) != Z_OK)
+      return false;
+
+    fin_zstream.next_out = zbuf;
+    fin_zstream.avail_out = zbuf_size;
+    fin_zstream.next_in = rows;
+    fin_zstream.avail_in = (uInt)filtered_size;
+    int zret = deflate(&fin_zstream, Z_FINISH);
+    if (zret != Z_STREAM_END)
+    {
+      deflateEnd(&fin_zstream);
+      return false;
+    }
+    *zsize = fin_zstream.total_out;
+    deflateEnd(&fin_zstream);
+  }
+  return true;
+}
+
+int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int first, unsigned int loops, unsigned int coltype, int deflate_method, int iter, unsigned int mt_threads, ExactCandidatesMode exact_mode, const ZlibFinalOptions& zlib_opts)
+{
+  FILE * f = 0;
   unsigned int i, j, k;
   unsigned int x0, y0, w0, h0, dop, bop;
   unsigned int idat_size, zbuf_size, zsize;
-  unsigned char * zbuf;
+  unsigned char * zbuf = 0;
   unsigned char header[8] = {137, 80, 78, 71, 13, 10, 26, 10};
   unsigned int num_frames = frames.size();
   unsigned int width = frames[0].w;
@@ -1533,6 +1862,15 @@ int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int f
   unsigned char * over3 = new unsigned char[imagesize];
   unsigned char * rest  = new unsigned char[imagesize];
   unsigned char * rows  = new unsigned char[rowsbuf_sz];
+  EvalScratch final_scratch;
+  memset(&final_scratch, 0, sizeof(EvalScratch));
+  std::vector<EvalScratch> eval_pool;
+  int status = 1;
+  const unsigned int pool_threads = (mt_threads > 0) ? ((mt_threads > 6) ? 6 : mt_threads) : 1;
+  const int exact_enabled = (exact_mode == kExactCandidatesOn && (deflate_method == 1 || deflate_method == 2)) ? 1 : 0;
+
+  if (!temp || !over1 || !over2 || !over3 || !rest || !rows)
+    goto cleanup;
 
   if (trnssize)
   {
@@ -1554,7 +1892,13 @@ int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int f
     }
   }
 
-  if ((f = fopen(szOut, "wb")) != 0)
+  f = fopen(szOut, "wb");
+  if (!f)
+  {
+    printf( "Error: couldn't open file for writing\n" );
+    goto cleanup;
+  }
+
   {
     unsigned char buf_IHDR[13];
     unsigned char buf_acTL[8];
@@ -1571,127 +1915,32 @@ int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int f
     png_save_uint_32(buf_acTL, num_frames-first);
     png_save_uint_32(buf_acTL + 4, loops);
 
-    if (fwrite(header, 1, 8, f) != 8)
-    {
-      fclose(f);
-      delete[] temp;
-      delete[] over1;
-      delete[] over2;
-      delete[] over3;
-      delete[] rest;
-      delete[] rows;
-      return 1;
-    }
-
-    if (!write_chunk(f, "IHDR", buf_IHDR, 13))
-    {
-      fclose(f);
-      delete[] temp;
-      delete[] over1;
-      delete[] over2;
-      delete[] over3;
-      delete[] rest;
-      delete[] rows;
-      return 1;
-    }
-
+    if (fwrite(header, 1, 8, f) != 8) goto cleanup;
+    if (!write_chunk(f, "IHDR", buf_IHDR, 13)) goto cleanup;
     if (num_frames > 1)
     {
-      if (!write_chunk(f, "acTL", buf_acTL, 8))
-      {
-        fclose(f);
-        delete[] temp;
-        delete[] over1;
-        delete[] over2;
-        delete[] over3;
-        delete[] rest;
-        delete[] rows;
-        return 1;
-      }
+      if (!write_chunk(f, "acTL", buf_acTL, 8)) goto cleanup;
     }
     else
       first = 0;
-
-    if (palsize > 0)
-    {
-      if (!write_chunk(f, "PLTE", (unsigned char *)(&palette), palsize*3))
-      {
-        fclose(f);
-        delete[] temp;
-        delete[] over1;
-        delete[] over2;
-        delete[] over3;
-        delete[] rest;
-        delete[] rows;
-        return 1;
-      }
-    }
-
-    if (trnssize > 0)
-    {
-      if (!write_chunk(f, "tRNS", trns, trnssize))
-      {
-        fclose(f);
-        delete[] temp;
-        delete[] over1;
-        delete[] over2;
-        delete[] over3;
-        delete[] rest;
-        delete[] rows;
-        return 1;
-      }
-    }
-
-    op_zstream1.data_type = Z_BINARY;
-    op_zstream1.zalloc = Z_NULL;
-    op_zstream1.zfree = Z_NULL;
-    op_zstream1.opaque = Z_NULL;
-    if (deflateInit2(&op_zstream1, Z_BEST_SPEED+1, 8, 15, 8, Z_DEFAULT_STRATEGY) != Z_OK)
-    {
-      fclose(f);
-      delete[] temp;
-      delete[] over1;
-      delete[] over2;
-      delete[] over3;
-      delete[] rest;
-      delete[] rows;
-      return 1;
-    }
-
-    op_zstream2.data_type = Z_BINARY;
-    op_zstream2.zalloc = Z_NULL;
-    op_zstream2.zfree = Z_NULL;
-    op_zstream2.opaque = Z_NULL;
-    if (deflateInit2(&op_zstream2, Z_BEST_SPEED+1, 8, 15, 8, Z_FILTERED) != Z_OK)
-    {
-      deflateEnd(&op_zstream1);
-      fclose(f);
-      delete[] temp;
-      delete[] over1;
-      delete[] over2;
-      delete[] over3;
-      delete[] rest;
-      delete[] rows;
-      return 1;
-    }
+    if (palsize > 0 && !write_chunk(f, "PLTE", (unsigned char *)(&palette), palsize*3)) goto cleanup;
+    if (trnssize > 0 && !write_chunk(f, "tRNS", trns, trnssize)) goto cleanup;
 
     idat_size = (unsigned int)rowsbuf_sz;
     zbuf_size = (unsigned int)zbuf_size_sz;
-
     zbuf = new unsigned char[zbuf_size];
-    op_zbuf1 = new unsigned char[zbuf_size];
-    op_zbuf2 = new unsigned char[zbuf_size];
-    row_buf = new unsigned char[rowbytes + 1];
-    sub_row = new unsigned char[rowbytes + 1];
-    up_row = new unsigned char[rowbytes + 1];
-    avg_row = new unsigned char[rowbytes + 1];
-    paeth_row = new unsigned char[rowbytes + 1];
+    if (!zbuf)
+      goto cleanup;
 
-    row_buf[0] = 0;
-    sub_row[0] = 1;
-    up_row[0] = 2;
-    avg_row[0] = 3;
-    paeth_row[0] = 4;
+    if (!init_eval_scratch(final_scratch, rowbytes, zbuf_size, rowsbuf_sz, 0))
+      goto cleanup;
+
+    eval_pool.resize(pool_threads);
+    for (unsigned int t=0; t<pool_threads; t++)
+    {
+      if (!init_eval_scratch(eval_pool[t], rowbytes, zbuf_size, rowsbuf_sz, exact_enabled))
+        goto cleanup;
+    }
 
     x0 = 0;
     y0 = 0;
@@ -1700,96 +1949,43 @@ int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int f
     bop = 0;
     next_seq_num = 0;
 
+    CandidateEval current;
+    memset(&current, 0, sizeof(CandidateEval));
+    current.p = frames[0].p;
+    current.x = (int)x0;
+    current.y = (int)y0;
+    current.w = (int)w0;
+    current.h = (int)h0;
+    current.op_id = 0;
+
     printf("saving %s (frame %d of %d)\n", szOut, 1-first, num_frames-first);
-    for (j=0; j<6; j++)
-      op[j].valid = 0;
-    deflate_rect_op(frames[0].p, x0, y0, w0, h0, bpp, rowbytes, zbuf_size, 0);
-    if (!deflate_rect_fin(deflate_method, iter, zbuf, &zsize, bpp, rowbytes, rows, zbuf_size, 0))
-    {
-      fclose(f);
-      delete[] zbuf;
-      delete[] op_zbuf1;
-      delete[] op_zbuf2;
-      delete[] row_buf;
-      delete[] sub_row;
-      delete[] up_row;
-      delete[] avg_row;
-      delete[] paeth_row;
-      deflateEnd(&op_zstream1);
-      deflateEnd(&op_zstream2);
-      delete[] temp;
-      delete[] over1;
-      delete[] over2;
-      delete[] over3;
-      delete[] rest;
-      delete[] rows;
-      return 1;
-    }
+    if (!evaluate_candidate(final_scratch, current, bpp, (int)rowbytes, (int)zbuf_size)) goto cleanup;
+    if (!deflate_rect_fin(final_scratch, deflate_method, iter, zbuf, &zsize, bpp, (int)rowbytes, rows, (int)zbuf_size, current, zlib_opts)) goto cleanup;
 
     if (first)
     {
-      if (!write_IDATs(f, 0, zbuf, zsize, idat_size))
-      {
-        fclose(f);
-        delete[] zbuf;
-        delete[] op_zbuf1;
-        delete[] op_zbuf2;
-        delete[] row_buf;
-        delete[] sub_row;
-        delete[] up_row;
-        delete[] avg_row;
-        delete[] paeth_row;
-        deflateEnd(&op_zstream1);
-        deflateEnd(&op_zstream2);
-        delete[] temp;
-        delete[] over1;
-        delete[] over2;
-        delete[] over3;
-        delete[] rest;
-        delete[] rows;
-        return 1;
-      }
+      if (!write_IDATs(f, 0, zbuf, zsize, idat_size)) goto cleanup;
 
+      memset(&current, 0, sizeof(CandidateEval));
+      current.p = frames[1].p;
+      current.x = (int)x0;
+      current.y = (int)y0;
+      current.w = (int)w0;
+      current.h = (int)h0;
+      current.op_id = 0;
       printf("saving %s (frame %d of %d)\n", szOut, 1, num_frames-first);
-      for (j=0; j<6; j++)
-        op[j].valid = 0;
-      deflate_rect_op(frames[1].p, x0, y0, w0, h0, bpp, rowbytes, zbuf_size, 0);
-      if (!deflate_rect_fin(deflate_method, iter, zbuf, &zsize, bpp, rowbytes, rows, zbuf_size, 0))
-      {
-        fclose(f);
-        delete[] zbuf;
-        delete[] op_zbuf1;
-        delete[] op_zbuf2;
-        delete[] row_buf;
-        delete[] sub_row;
-        delete[] up_row;
-        delete[] avg_row;
-        delete[] paeth_row;
-        deflateEnd(&op_zstream1);
-        deflateEnd(&op_zstream2);
-        delete[] temp;
-        delete[] over1;
-        delete[] over2;
-        delete[] over3;
-        delete[] rest;
-        delete[] rows;
-        return 1;
-      }
+      if (!evaluate_candidate(final_scratch, current, bpp, (int)rowbytes, (int)zbuf_size)) goto cleanup;
+      if (!deflate_rect_fin(final_scratch, deflate_method, iter, zbuf, &zsize, bpp, (int)rowbytes, rows, (int)zbuf_size, current, zlib_opts)) goto cleanup;
     }
 
     for (i=first; i<num_frames-1; i++)
     {
-      unsigned int op_min;
-      int          op_best;
-
+      std::vector<CandidateEval> candidates;
+      candidates.reserve(6);
       printf("saving %s (frame %d of %d)\n", szOut, i-first+2, num_frames-first);
-      for (j=0; j<6; j++)
-        op[j].valid = 0;
 
-      /* dispose = none */
-      get_rect(width, height, frames[i].p, frames[i+1].p, over1, bpp, rowbytes, zbuf_size, has_tcolor, tcolor, 0);
+      get_rect_candidates(width, height, frames[i].p, frames[i+1].p, over1, bpp, rowbytes, has_tcolor, tcolor, 0, candidates);
 
-      /* dispose = background */
       if (has_tcolor)
       {
         memcpy(temp, frames[i].p, imagesize);
@@ -1800,28 +1996,33 @@ int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int f
         else
           for (j=0; j<h0; j++)
             memset(temp + ((j+y0)*width + x0)*bpp, tcolor, w0*bpp);
-
-        get_rect(width, height, temp, frames[i+1].p, over2, bpp, rowbytes, zbuf_size, has_tcolor, tcolor, 1);
+        get_rect_candidates(width, height, temp, frames[i+1].p, over2, bpp, rowbytes, has_tcolor, tcolor, 1, candidates);
       }
 
-      /* dispose = previous */
       if (i > first)
-        get_rect(width, height, rest, frames[i+1].p, over3, bpp, rowbytes, zbuf_size, has_tcolor, tcolor, 2);
+        get_rect_candidates(width, height, rest, frames[i+1].p, over3, bpp, rowbytes, has_tcolor, tcolor, 2, candidates);
 
-      op_min = op[0].size;
-      op_best = 0;
-      for (j=1; j<6; j++)
-      if (op[j].valid)
+      run_parallel_indices((unsigned int)candidates.size(), pool_threads, [&](unsigned int begin, unsigned int end, unsigned int worker_id) {
+        EvalScratch& scratch = eval_pool[worker_id];
+        for (unsigned int idx = begin; idx < end; idx++)
+          evaluate_candidate(scratch, candidates[idx], bpp, (int)rowbytes, (int)zbuf_size);
+      });
+
+      if (exact_enabled)
       {
-        if (op[j].size < op_min)
-        {
-          op_min = op[j].size;
-          op_best = j;
-        }
+        run_parallel_indices((unsigned int)candidates.size(), pool_threads, [&](unsigned int begin, unsigned int end, unsigned int worker_id) {
+          EvalScratch& scratch = eval_pool[worker_id];
+          for (unsigned int idx = begin; idx < end; idx++)
+            compress_candidate_exact(scratch, candidates[idx], deflate_method, iter, bpp, (int)rowbytes, (int)zbuf_size);
+        });
       }
 
-      dop = op_best >> 1;
+      int best_idx = choose_best_candidate(candidates, exact_enabled);
+      if (best_idx < 0)
+        goto cleanup;
+      CandidateEval& best = candidates[best_idx];
 
+      dop = (unsigned int)(best.op_id >> 1);
       png_save_uint_32(buf_fcTL, next_seq_num++);
       png_save_uint_32(buf_fcTL + 4, w0);
       png_save_uint_32(buf_fcTL + 8, h0);
@@ -1831,54 +2032,12 @@ int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int f
       png_save_uint_16(buf_fcTL + 22, frames[i].delay_den);
       buf_fcTL[24] = dop;
       buf_fcTL[25] = bop;
-      if (!write_chunk(f, "fcTL", buf_fcTL, 26))
-      {
-        fclose(f);
-        delete[] zbuf;
-        delete[] op_zbuf1;
-        delete[] op_zbuf2;
-        delete[] row_buf;
-        delete[] sub_row;
-        delete[] up_row;
-        delete[] avg_row;
-        delete[] paeth_row;
-        deflateEnd(&op_zstream1);
-        deflateEnd(&op_zstream2);
-        delete[] temp;
-        delete[] over1;
-        delete[] over2;
-        delete[] over3;
-        delete[] rest;
-        delete[] rows;
-        return 1;
-      }
+      if (!write_chunk(f, "fcTL", buf_fcTL, 26)) goto cleanup;
 
-      if (!write_IDATs(f, i, zbuf, zsize, idat_size))
-      {
-        fclose(f);
-        delete[] zbuf;
-        delete[] op_zbuf1;
-        delete[] op_zbuf2;
-        delete[] row_buf;
-        delete[] sub_row;
-        delete[] up_row;
-        delete[] avg_row;
-        delete[] paeth_row;
-        deflateEnd(&op_zstream1);
-        deflateEnd(&op_zstream2);
-        delete[] temp;
-        delete[] over1;
-        delete[] over2;
-        delete[] over3;
-        delete[] rest;
-        delete[] rows;
-        return 1;
-      }
+      if (!write_IDATs(f, i, zbuf, zsize, idat_size)) goto cleanup;
 
-      /* process apng dispose - begin */
       if (dop != 2)
         memcpy(rest, frames[i].p, imagesize);
-
       if (dop == 1)
       {
         if (coltype == 2)
@@ -1889,35 +2048,15 @@ int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int f
           for (j=0; j<h0; j++)
             memset(rest + ((j+y0)*width + x0)*bpp, tcolor, w0*bpp);
       }
-      /* process apng dispose - end */
 
-      x0 = op[op_best].x;
-      y0 = op[op_best].y;
-      w0 = op[op_best].w;
-      h0 = op[op_best].h;
-      bop = op_best & 1;
+      x0 = (unsigned int)best.x;
+      y0 = (unsigned int)best.y;
+      w0 = (unsigned int)best.w;
+      h0 = (unsigned int)best.h;
+      bop = (unsigned int)(best.op_id & 1);
 
-      if (!deflate_rect_fin(deflate_method, iter, zbuf, &zsize, bpp, rowbytes, rows, zbuf_size, op_best))
-      {
-        fclose(f);
-        delete[] zbuf;
-        delete[] op_zbuf1;
-        delete[] op_zbuf2;
-        delete[] row_buf;
-        delete[] sub_row;
-        delete[] up_row;
-        delete[] avg_row;
-        delete[] paeth_row;
-        deflateEnd(&op_zstream1);
-        deflateEnd(&op_zstream2);
-        delete[] temp;
-        delete[] over1;
-        delete[] over2;
-        delete[] over3;
-        delete[] rest;
-        delete[] rows;
-        return 1;
-      }
+      if (!deflate_rect_fin(final_scratch, deflate_method, iter, zbuf, &zsize, bpp, (int)rowbytes, rows, (int)zbuf_size, best, zlib_opts))
+        goto cleanup;
     }
 
     if (num_frames > 1)
@@ -1931,117 +2070,32 @@ int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int f
       png_save_uint_16(buf_fcTL + 22, frames[num_frames-1].delay_den);
       buf_fcTL[24] = 0;
       buf_fcTL[25] = bop;
-      if (!write_chunk(f, "fcTL", buf_fcTL, 26))
-      {
-        fclose(f);
-        delete[] zbuf;
-        delete[] op_zbuf1;
-        delete[] op_zbuf2;
-        delete[] row_buf;
-        delete[] sub_row;
-        delete[] up_row;
-        delete[] avg_row;
-        delete[] paeth_row;
-        deflateEnd(&op_zstream1);
-        deflateEnd(&op_zstream2);
-        delete[] temp;
-        delete[] over1;
-        delete[] over2;
-        delete[] over3;
-        delete[] rest;
-        delete[] rows;
-        return 1;
-      }
+      if (!write_chunk(f, "fcTL", buf_fcTL, 26)) goto cleanup;
     }
 
-    if (!write_IDATs(f, num_frames-1, zbuf, zsize, idat_size))
-    {
-      fclose(f);
-      delete[] zbuf;
-      delete[] op_zbuf1;
-      delete[] op_zbuf2;
-      delete[] row_buf;
-      delete[] sub_row;
-      delete[] up_row;
-      delete[] avg_row;
-      delete[] paeth_row;
-      deflateEnd(&op_zstream1);
-      deflateEnd(&op_zstream2);
-      delete[] temp;
-      delete[] over1;
-      delete[] over2;
-      delete[] over3;
-      delete[] rest;
-      delete[] rows;
-      return 1;
-    }
-
-    if (!write_chunk(f, "IEND", 0, 0))
-    {
-      fclose(f);
-      delete[] zbuf;
-      delete[] op_zbuf1;
-      delete[] op_zbuf2;
-      delete[] row_buf;
-      delete[] sub_row;
-      delete[] up_row;
-      delete[] avg_row;
-      delete[] paeth_row;
-      deflateEnd(&op_zstream1);
-      deflateEnd(&op_zstream2);
-      delete[] temp;
-      delete[] over1;
-      delete[] over2;
-      delete[] over3;
-      delete[] rest;
-      delete[] rows;
-      return 1;
-    }
-    if (fclose(f) != 0)
-    {
-      delete[] zbuf;
-      delete[] op_zbuf1;
-      delete[] op_zbuf2;
-      delete[] row_buf;
-      delete[] sub_row;
-      delete[] up_row;
-      delete[] avg_row;
-      delete[] paeth_row;
-      deflateEnd(&op_zstream1);
-      deflateEnd(&op_zstream2);
-      delete[] temp;
-      delete[] over1;
-      delete[] over2;
-      delete[] over3;
-      delete[] rest;
-      delete[] rows;
-      return 1;
-    }
-
-    delete[] zbuf;
-    delete[] op_zbuf1;
-    delete[] op_zbuf2;
-    delete[] row_buf;
-    delete[] sub_row;
-    delete[] up_row;
-    delete[] avg_row;
-    delete[] paeth_row;
-
-    deflateEnd(&op_zstream1);
-    deflateEnd(&op_zstream2);
+    if (!write_IDATs(f, num_frames-1, zbuf, zsize, idat_size)) goto cleanup;
+    if (!write_chunk(f, "IEND", 0, 0)) goto cleanup;
+    status = 0;
   }
-  else
+
+cleanup:
+  if (f)
   {
-    printf( "Error: couldn't open file for writing\n" );
-    delete[] temp;
-    delete[] over1;
-    delete[] over2;
-    delete[] over3;
-    delete[] rest;
-    delete[] rows;
-    return 1;
+    if (status == 0)
+    {
+      if (fclose(f) != 0)
+        status = 1;
+    }
+    else
+      fclose(f);
+    f = 0;
   }
 
+  free_eval_scratch(final_scratch);
+  for (unsigned int t=0; t<eval_pool.size(); t++)
+    free_eval_scratch(eval_pool[t]);
+
+  delete[] zbuf;
   delete[] temp;
   delete[] over1;
   delete[] over2;
@@ -2049,9 +2103,31 @@ int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int f
   delete[] rest;
   delete[] rows;
 
-  return 0;
+  return status;
 }
 /* APNG encoder - end */
+
+int parse_zlib_strategy(const char * name, int * strategy)
+{
+  if (!name || !strategy)
+    return 0;
+  if (strcmp(name, "default") == 0)  { *strategy = Z_DEFAULT_STRATEGY; return 1; }
+  if (strcmp(name, "filtered") == 0) { *strategy = Z_FILTERED; return 1; }
+  if (strcmp(name, "huffman") == 0)  { *strategy = Z_HUFFMAN_ONLY; return 1; }
+  if (strcmp(name, "rle") == 0)      { *strategy = Z_RLE; return 1; }
+  if (strcmp(name, "fixed") == 0)    { *strategy = Z_FIXED; return 1; }
+  return 0;
+}
+
+int parse_zlib_mode(const char * name, int * mode)
+{
+  if (!name || !mode)
+    return 0;
+  if (strcmp(name, "speed") == 0)    { *mode = 0; return 1; }
+  if (strcmp(name, "balanced") == 0) { *mode = 1; return 1; }
+  if (strcmp(name, "size") == 0)     { *mode = 2; return 1; }
+  return 0;
+}
 
 int main(int argc, char** argv)
 {
@@ -2071,6 +2147,13 @@ int main(int argc, char** argv)
   int    liqMaxQuality = 100;
   unsigned int liqThreads = 0;
   unsigned int mtThreads = 1;
+  ExactCandidatesMode exact_mode = kExactCandidatesOff;
+  ZlibFinalOptions zlib_opts;
+  memset(&zlib_opts, 0, sizeof(ZlibFinalOptions));
+  zlib_opts.level = Z_BEST_COMPRESSION;
+  zlib_opts.memLevel = 8;
+  zlib_opts.strategy = Z_DEFAULT_STRATEGY;
+  zlib_opts.mode = 1;
 
   printf("\nAPNG Optimizer 1.4");
 
@@ -2088,7 +2171,12 @@ int main(int argc, char** argv)
            "--liq-dither=F    : imagequant dithering (0..1), default %.2f\n"
            "--liq-quality=A-B : imagequant quality range (0..100), default %d-%d\n"
            "--liq-threads=N   : set RAYON_NUM_THREADS for imagequant\n"
-           "--mt=N            : apngopt local threads for independent stages\n",
+           "--mt=N            : apngopt local threads for independent stages\n"
+           "--exact-candidates: exact candidate ranking for -z1/-z2 (slower)\n"
+           "--zlib-level=N    : final -z0 level (1..9)\n"
+           "--zlib-mem-level=N: final -z0 memLevel (1..9)\n"
+           "--zlib-strategy=S : final -z0 strategy (default|filtered|huffman|rle|fixed)\n"
+           "--zlib-mode=M     : final -z0 preset (speed|balanced|size), overridden by explicit --zlib-*\n",
            iter, disableImageQuant, liqSpeed, liqMaxColors, liqPosterization, liqDither, liqMinQuality, liqMaxQuality);
     return 1;
   }
@@ -2152,6 +2240,53 @@ int main(int argc, char** argv)
         if (t > 0)
           mtThreads = (unsigned int)t;
       }
+      else if (strcmp(szOpt, "--exact-candidates") == 0)
+      {
+        exact_mode = kExactCandidatesOn;
+      }
+      else if (strncmp(szOpt, "--exact-candidates=", 19) == 0)
+      {
+        int v = atoi(szOpt + 19);
+        exact_mode = (v > 0) ? kExactCandidatesOn : kExactCandidatesOff;
+      }
+      else if (strncmp(szOpt, "--zlib-level=", 13) == 0)
+      {
+        int v = atoi(szOpt + 13);
+        if (v < 1) v = 1;
+        if (v > 9) v = 9;
+        zlib_opts.level = v;
+        zlib_opts.hasLevel = 1;
+      }
+      else if (strncmp(szOpt, "--zlib-mem-level=", 17) == 0)
+      {
+        int v = atoi(szOpt + 17);
+        if (v < 1) v = 1;
+        if (v > 9) v = 9;
+        zlib_opts.memLevel = v;
+        zlib_opts.hasMemLevel = 1;
+      }
+      else if (strncmp(szOpt, "--zlib-strategy=", 16) == 0)
+      {
+        int strategy = 0;
+        if (parse_zlib_strategy(szOpt + 16, &strategy))
+        {
+          zlib_opts.strategy = strategy;
+          zlib_opts.hasStrategy = 1;
+        }
+        else
+          printf("warning: unknown zlib strategy '%s' ignored\n", szOpt + 16);
+      }
+      else if (strncmp(szOpt, "--zlib-mode=", 12) == 0)
+      {
+        int mode = 0;
+        if (parse_zlib_mode(szOpt + 12, &mode))
+        {
+          zlib_opts.mode = mode;
+          zlib_opts.hasMode = 1;
+        }
+        else
+          printf("warning: unknown zlib mode '%s' ignored\n", szOpt + 12);
+      }
     }
     else if (szOpt[0] == '-')
     {
@@ -2190,6 +2325,12 @@ int main(int argc, char** argv)
   else if (deflate_method == 2)
     printf(" using ZOPFLI with %d iterations\n\n", iter);
 
+  if (exact_mode == kExactCandidatesOn && deflate_method == 0)
+    printf("warning: --exact-candidates is ignored for -z0\n");
+
+  if (deflate_method != 0 && (zlib_opts.hasMode || zlib_opts.hasLevel || zlib_opts.hasMemLevel || zlib_opts.hasStrategy))
+    printf("warning: --zlib-* options apply to -z0 only and are ignored for current mode\n");
+
   if (szOut.empty())
   {
     szOut = szInput;
@@ -2223,7 +2364,7 @@ int main(int argc, char** argv)
     }
   }
 
-  if (save_apng(szOut.c_str(), frames, first, loops, coltype, deflate_method, iter) != 0)
+  if (save_apng(szOut.c_str(), frames, first, loops, coltype, deflate_method, iter, mtThreads, exact_mode, zlib_opts) != 0)
   {
     printf("save_apng() failed: '%s'\n", szOut.c_str());
     for (size_t j=0; j<frames.size(); j++)

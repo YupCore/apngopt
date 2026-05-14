@@ -23,6 +23,12 @@
 -z2  : zopfli compression
 -i## : number of iterations, default -i15
 -d## : disable imagequant compress 0 or 1, default 0  (v1.4.1 添加，-d1 执行原1.4的逻辑)
+--mt=N            : apngopt local threads for independent stages (including candidate evaluation)
+--exact-candidates: for -z1/-z2, recompress all valid candidates with final backend before candidate selection (slower, usually better size stability/selection)
+--zlib-mode=M     : final -z0 preset (speed|balanced|size)
+--zlib-level=N    : final -z0 compression level (1..9)
+--zlib-mem-level=N: final -z0 memLevel (1..9)
+--zlib-strategy=S : final -z0 strategy (default|filtered|huffman|rle|fixed)
 ```
 
   Build (MSVC only):
@@ -48,6 +54,9 @@
 - Rust/Cargo is required to build `vendor/libimagequant/imagequant-sys`.
 - `libimagequant` threading is Rayon-backed; control with `RAYON_NUM_THREADS`.
 - `-z1` is wired to `vendor/7z2601` Deflate sources (LZMA SDK 26.01), while keeping the existing `compress_rfc1950_7z` call surface in `7z/7z.h`.
+- `--exact-candidates` is ignored for `-z0`.
+- `--zlib-*` flags apply only to final `-z0` compression, not to the fast zlib pre-eval streams used for candidate ranking.
+- `--zlib-mode` sets defaults; explicit `--zlib-level`, `--zlib-mem-level`, `--zlib-strategy` override mode values.
 
 
 --------------------------------
