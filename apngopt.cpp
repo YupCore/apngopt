@@ -30,6 +30,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
+#include <limits>
+#include <string>
+#include <thread>
 #include <vector>
 #include "png.h"     /* original (unpatched) libpng is ok */
 #include "zlib.h"
@@ -70,6 +74,57 @@ unsigned int    palsize, trnssize;
 unsigned int    next_seq_num;
 
 const unsigned long cMaxPNGSize = 1000000UL;
+const size_t cMaxChunkDataLength = 0x7fffffffULL;
+
+static bool checked_mul_size(size_t a, size_t b, size_t *out)
+{
+  if (!out)
+    return false;
+  if (a != 0 && b > (std::numeric_limits<size_t>::max() / a))
+    return false;
+  *out = a * b;
+  return true;
+}
+
+static bool checked_add_size(size_t a, size_t b, size_t *out)
+{
+  if (!out)
+    return false;
+  if (a > (std::numeric_limits<size_t>::max() - b))
+    return false;
+  *out = a + b;
+  return true;
+}
+
+static bool compute_image_layout(unsigned int w, unsigned int h, unsigned int bpp, size_t *rowbytes, size_t *imagesize)
+{
+  size_t rb = 0;
+  size_t isz = 0;
+  if (!checked_mul_size((size_t)w, (size_t)bpp, &rb))
+    return false;
+  if (!checked_mul_size(rb, (size_t)h, &isz))
+    return false;
+  if (rowbytes)
+    *rowbytes = rb;
+  if (imagesize)
+    *imagesize = isz;
+  return true;
+}
+
+static bool set_imagequant_thread_env(unsigned int threads)
+{
+  if (threads == 0)
+    return true;
+#ifdef _WIN32
+  char buf[16];
+  sprintf(buf, "%u", threads);
+  return (_putenv_s("RAYON_NUM_THREADS", buf) == 0);
+#else
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%u", threads);
+  return (setenv("RAYON_NUM_THREADS", buf, 1) == 0);
+#endif
+}
 
 /* APNG decoder - begin */
 void info_fn(png_structp png_ptr, png_infop info_ptr)
@@ -132,11 +187,19 @@ inline unsigned int read_chunk(FILE * f, CHUNK * pChunk)
   pChunk->p = 0;
   if (fread(&len, 4, 1, f) == 1)
   {
-    pChunk->size = png_get_uint_32(len) + 12;
+    const size_t data_len = png_get_uint_32(len);
+    size_t chunk_size = 0;
+    if (data_len > cMaxChunkDataLength || !checked_add_size(data_len, 12, &chunk_size) || chunk_size > (size_t)UINT_MAX)
+      return 0;
+
+    pChunk->size = (unsigned int)chunk_size;
     pChunk->p = new unsigned char[pChunk->size];
     memcpy(pChunk->p, len, 4);
     if (fread(pChunk->p + 4, pChunk->size - 4, 1, f) == 1)
       return *(unsigned int *)(pChunk->p + 4);
+    delete[] pChunk->p;
+    pChunk->p = 0;
+    pChunk->size = 0;
   }
   return 0;
 }
@@ -146,8 +209,10 @@ int processing_start(png_structp & png_ptr, png_infop & info_ptr, void * frame_p
   unsigned char header[8] = {137, 80, 78, 71, 13, 10, 26, 10};
 
   png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+  if (!png_ptr)
+    return 1;
   info_ptr = png_create_info_struct(png_ptr);
-  if (!png_ptr || !info_ptr)
+  if (!info_ptr)
     return 1;
 
   if (setjmp(png_jmpbuf(png_ptr)))
@@ -202,7 +267,7 @@ int processing_finish(png_structp png_ptr, png_infop info_ptr)
   return 0;
 }
 
-int load_apng(char * szIn, std::vector<APNGFrame>& frames, unsigned int & first, unsigned int & loops)
+int load_apng(const char * szIn, std::vector<APNGFrame>& frames, unsigned int & first, unsigned int & loops)
 {
   FILE * f;
   unsigned int id, i, j, w, h, w0, h0, x0, y0;
@@ -246,11 +311,20 @@ int load_apng(char * szIn, std::vector<APNGFrame>& frames, unsigned int & first,
         delay_den = 10;
         dop = 0;
         bop = 0;
-        rowbytes = w * 4;
-        imagesize = h * rowbytes;
+        size_t rowbytes_sz = 0;
+        size_t imagesize_sz = 0;
+        if (!compute_image_layout(w, h, 4, &rowbytes_sz, &imagesize_sz) ||
+            rowbytes_sz > (size_t)UINT_MAX || imagesize_sz > (size_t)UINT_MAX)
+        {
+          delete[] chunkIHDR.p;
+          fclose(f);
+          return res;
+        }
+        rowbytes = (unsigned int)rowbytes_sz;
+        imagesize = (unsigned int)imagesize_sz;
 
         frameRaw.p = new unsigned char[imagesize];
-        frameRaw.rows = new png_bytep[h * sizeof(png_bytep)];
+        frameRaw.rows = new png_bytep[h];
         for (j=0; j<h; j++)
           frameRaw.rows[j] = frameRaw.p + j * rowbytes;
 
@@ -259,7 +333,7 @@ int load_apng(char * szIn, std::vector<APNGFrame>& frames, unsigned int & first,
           frameCur.w = w;
           frameCur.h = h;
           frameCur.p = new unsigned char[imagesize];
-          frameCur.rows = new png_bytep[h * sizeof(png_bytep)];
+          frameCur.rows = new png_bytep[h];
           for (j=0; j<h; j++)
             frameCur.rows[j] = frameCur.p + j * rowbytes;
 
@@ -283,7 +357,7 @@ int load_apng(char * szIn, std::vector<APNGFrame>& frames, unsigned int & first,
                 if (!processing_finish(png_ptr, info_ptr))
                 {
                   frameNext.p = new unsigned char[imagesize];
-                  frameNext.rows = new png_bytep[h * sizeof(png_bytep)];
+                  frameNext.rows = new png_bytep[h];
                   for (j=0; j<h; j++)
                     frameNext.rows[j] = frameNext.p + j * rowbytes;
 
@@ -453,6 +527,50 @@ void optim_dirty(std::vector<APNGFrame>& frames)
       if (sp[3] == 0)
          sp[0] = sp[1] = sp[2] = 0;
   }
+}
+
+void optim_dirty_mt(std::vector<APNGFrame>& frames, unsigned int threads)
+{
+  if (threads <= 1 || frames.size() < 2)
+  {
+    optim_dirty(frames);
+    return;
+  }
+
+  const unsigned int size = frames[0].w * frames[0].h;
+  if (threads > frames.size())
+    threads = (unsigned int)frames.size();
+  if (threads < 1)
+    threads = 1;
+
+  std::vector<std::thread> workers;
+  workers.reserve(threads);
+
+  const unsigned int chunk = (unsigned int)((frames.size() + threads - 1) / threads);
+  for (unsigned int t = 0; t < threads; t++)
+  {
+    const unsigned int begin = t * chunk;
+    unsigned int end = begin + chunk;
+    if (begin >= frames.size())
+      break;
+    if (end > frames.size())
+      end = (unsigned int)frames.size();
+
+    workers.emplace_back([&frames, size, begin, end]() {
+      for (unsigned int i = begin; i < end; i++)
+      {
+        unsigned char * sp = frames[i].p;
+        for (unsigned int j = 0; j < size; j++, sp += 4)
+        {
+          if (sp[3] == 0)
+            sp[0] = sp[1] = sp[2] = 0;
+        }
+      }
+    });
+  }
+
+  for (unsigned int t = 0; t < workers.size(); t++)
+    workers[t].join();
 }
 
 void optim_duplicates(std::vector<APNGFrame>& frames, unsigned int first)
@@ -725,34 +843,54 @@ void optim_downconvert(std::vector<APNGFrame>& frames, unsigned int & coltype)
     }
   }
 }
-void optim_image(std::vector<APNGFrame>& frames, unsigned int & coltype, int minQuality, int maxQuality)
+static bool apply_imagequant_options(liq_attr *attr, int minQuality, int maxQuality, int liqSpeed, int liqMaxColors, int liqPosterization)
+{
+  if (!attr)
+    return false;
+  if (liq_set_quality(attr, minQuality, maxQuality) != LIQ_OK)
+    return false;
+  if (liqSpeed > 0 && liq_set_speed(attr, liqSpeed) != LIQ_OK)
+    return false;
+  if (liqMaxColors > 0 && liq_set_max_colors(attr, liqMaxColors) != LIQ_OK)
+    return false;
+  if (liqPosterization >= 0 && liq_set_min_posterization(attr, liqPosterization) != LIQ_OK)
+    return false;
+  return true;
+}
+
+bool optim_image(std::vector<APNGFrame>& frames, unsigned int & coltype, int minQuality, int maxQuality, int liqSpeed, int liqMaxColors, int liqPosterization, float liqDither)
 {
     unsigned int size = frames.size();
     if (size == 0)
-      return;
+      return false;
 
     unsigned int width = frames[0].w;
     unsigned int height = frames[0].h;
-    unsigned int imageSize = width * height * 4;
+    size_t imageSize = 0;
+    if (!compute_image_layout(width, height, 4, 0, &imageSize))
+      return false;
+    if (imageSize > (size_t)INT_MAX)
+      return false;
 
     liq_attr *attr = liq_attr_create();
     if (!attr)
-      return;
+      return false;
 
-    if (liq_set_quality(attr, minQuality, maxQuality) != LIQ_OK)
+    if (!apply_imagequant_options(attr, minQuality, maxQuality, liqSpeed, liqMaxColors, liqPosterization))
     {
       liq_attr_destroy(attr);
-      return;
+      return false;
     }
 
     liq_histogram *hist = liq_histogram_create(attr);
     if (!hist)
     {
       liq_attr_destroy(attr);
-      return;
+      return false;
     }
 
     std::vector<liq_image*> images(size, NULL);
+    std::vector<unsigned char> indexed;
     bool ok = true;
 
     for (unsigned int i = 0; i < size; i++)
@@ -773,12 +911,25 @@ void optim_image(std::vector<APNGFrame>& frames, unsigned int & coltype, int min
     if (ok)
     {
       liq_result *res = NULL;
-      coltype = 3;
-      if (liq_histogram_quantize(hist, attr, &res) == LIQ_OK && res)
+      liq_error qerr = liq_histogram_quantize(hist, attr, &res);
+      if (qerr == LIQ_OK && res)
       {
+        liq_error dither_err = liq_set_dithering_level(res, liqDither);
+        (void)dither_err;
+        if (ok)
+        {
+          size_t total_indexed = 0;
+          if (!checked_mul_size(imageSize, (size_t)size, &total_indexed))
+            ok = false;
+          else
+            indexed.resize(total_indexed);
+        }
+
         for (unsigned int i = 0; i < size; i++)
         {
-          if (liq_write_remapped_image(res, images[i], frames[i].p, imageSize) != LIQ_OK)
+          unsigned char *dst = indexed.data() + ((size_t)i * imageSize);
+          liq_error remap_err = liq_write_remapped_image(res, images[i], dst, imageSize);
+          if (!ok || remap_err != LIQ_OK)
           {
             ok = false;
             break;
@@ -801,7 +952,61 @@ void optim_image(std::vector<APNGFrame>& frames, unsigned int & coltype, int min
 
             /*process_callback(0.4 + i / float(palsize) * 0.1);*/
           }
+
+          for (unsigned int i = 0; i < size; i++)
+          {
+            memcpy(frames[i].p, indexed.data() + ((size_t)i * imageSize), imageSize);
+          }
+          coltype = 3;
         }
+      }
+      else if (qerr == LIQ_QUALITY_TOO_LOW && minQuality > 0)
+      {
+        liq_result *retry_res = NULL;
+        if (liq_set_quality(attr, 0, maxQuality) == LIQ_OK &&
+            liq_histogram_quantize(hist, attr, &retry_res) == LIQ_OK && retry_res)
+        {
+          liq_set_dithering_level(retry_res, liqDither);
+          size_t total_indexed = 0;
+          if (checked_mul_size(imageSize, (size_t)size, &total_indexed))
+            indexed.resize(total_indexed);
+          else
+            ok = false;
+
+          for (unsigned int i = 0; ok && i < size; i++)
+          {
+            unsigned char *dst = indexed.data() + ((size_t)i * imageSize);
+            if (liq_write_remapped_image(retry_res, images[i], dst, imageSize) != LIQ_OK)
+              ok = false;
+          }
+
+          if (ok)
+          {
+            const liq_palette *liqPalette = liq_get_palette(retry_res);
+            palsize = liqPalette->count;
+            trnssize = 0;
+            for (unsigned int i = 0; i < liqPalette->count; i++)
+            {
+              palette[i].r = liqPalette->entries[i].r;
+              palette[i].g = liqPalette->entries[i].g;
+              palette[i].b = liqPalette->entries[i].b;
+              trns[i] = liqPalette->entries[i].a;
+              if (trns[i] != 255)
+                trnssize = i + 1;
+            }
+            for (unsigned int i = 0; i < size; i++)
+              memcpy(frames[i].p, indexed.data() + ((size_t)i * imageSize), imageSize);
+            coltype = 3;
+          }
+        }
+        else
+          ok = false;
+        if (retry_res)
+          liq_result_destroy(retry_res);
+      }
+      else
+      {
+        ok = false;
       }
 
       if (res)
@@ -814,6 +1019,7 @@ void optim_image(std::vector<APNGFrame>& frames, unsigned int & coltype, int min
 
     liq_histogram_destroy(hist);
     liq_attr_destroy(attr);
+    return ok;
 }
 void write_chunk(FILE * f, const char * name, unsigned char * data, unsigned int length)
 {
@@ -1010,10 +1216,18 @@ void process_rect(unsigned char * row, int rowbytes, int bpp, int stride, int h,
   }
 }
 
-void deflate_rect_fin(int deflate_method, int iter, unsigned char * zbuf, unsigned int * zsize, int bpp, int stride, unsigned char * rows, int zbuf_size, int n)
+bool deflate_rect_fin(int deflate_method, int iter, unsigned char * zbuf, unsigned int * zsize, int bpp, int stride, unsigned char * rows, int zbuf_size, int n)
 {
+  if (!zbuf || !zsize || !rows || zbuf_size <= 0)
+    return false;
+
   unsigned char * row  = op[n].p + op[n].y*stride + op[n].x*bpp;
   int rowbytes = op[n].w*bpp;
+  size_t filtered_size = 0;
+  if (!checked_add_size((size_t)rowbytes, 1, &filtered_size) || !checked_mul_size(filtered_size, (size_t)op[n].h, &filtered_size))
+    return false;
+  if (filtered_size > (size_t)INT_MAX)
+    return false;
 
   if (op[n].filters == 0)
   {
@@ -1036,11 +1250,18 @@ void deflate_rect_fin(int deflate_method, int iter, unsigned char * zbuf, unsign
     size_t size = 0;
     ZopfliInitOptions(&opt_zopfli);
     opt_zopfli.numiterations = iter;
-    ZopfliCompress(&opt_zopfli, ZOPFLI_FORMAT_ZLIB, rows, op[n].h*(rowbytes + 1), &data, &size);
+    ZopfliCompress(&opt_zopfli, ZOPFLI_FORMAT_ZLIB, rows, filtered_size, &data, &size);
+    if (!data)
+      return false;
     if (size < (size_t)zbuf_size)
     {
       memcpy(zbuf, data, size);
-      *zsize = size;
+      *zsize = (unsigned int)size;
+    }
+    else
+    {
+      free(data);
+      return false;
     }
     free(data);
   }
@@ -1048,7 +1269,8 @@ void deflate_rect_fin(int deflate_method, int iter, unsigned char * zbuf, unsign
   if (deflate_method == 1)
   {
     unsigned size = zbuf_size;
-    compress_rfc1950_7z(rows, op[n].h*(rowbytes + 1), zbuf, size, iter<100 ? iter : 100, 255);
+    if (!compress_rfc1950_7z(rows, (unsigned)filtered_size, zbuf, size, iter<100 ? iter : 100, 255))
+      return false;
     *zsize = size;
   }
   else
@@ -1059,16 +1281,23 @@ void deflate_rect_fin(int deflate_method, int iter, unsigned char * zbuf, unsign
     fin_zstream.zalloc = Z_NULL;
     fin_zstream.zfree = Z_NULL;
     fin_zstream.opaque = Z_NULL;
-    deflateInit2(&fin_zstream, Z_BEST_COMPRESSION, 8, 15, 8, op[n].filters ? Z_FILTERED : Z_DEFAULT_STRATEGY);
+    if (deflateInit2(&fin_zstream, Z_BEST_COMPRESSION, 8, 15, 8, op[n].filters ? Z_FILTERED : Z_DEFAULT_STRATEGY) != Z_OK)
+      return false;
 
     fin_zstream.next_out = zbuf;
     fin_zstream.avail_out = zbuf_size;
     fin_zstream.next_in = rows;
-    fin_zstream.avail_in = op[n].h*(rowbytes + 1);
-    deflate(&fin_zstream, Z_FINISH);
+    fin_zstream.avail_in = (uInt)filtered_size;
+    int zret = deflate(&fin_zstream, Z_FINISH);
+    if (zret != Z_STREAM_END)
+    {
+      deflateEnd(&fin_zstream);
+      return false;
+    }
     *zsize = fin_zstream.total_out;
     deflateEnd(&fin_zstream);
   }
+  return true;
 }
 
 void deflate_rect_op(unsigned char *pdata, int x, int y, int w, int h, int bpp, int stride, int zbuf_size, int n)
@@ -1251,7 +1480,7 @@ void get_rect(unsigned int w, unsigned int h, unsigned char *pimage1, unsigned c
     deflate_rect_op(ptemp, x0, y0, w0, h0, bpp, stride, zbuf_size, n*2+1);
 }
 
-int save_apng(char * szOut, std::vector<APNGFrame>& frames, unsigned int first, unsigned int loops, unsigned int coltype, int deflate_method, int iter)
+int save_apng(const char * szOut, std::vector<APNGFrame>& frames, unsigned int first, unsigned int loops, unsigned int coltype, int deflate_method, int iter)
 {
   FILE * f;
   unsigned int i, j, k;
@@ -1265,15 +1494,29 @@ int save_apng(char * szOut, std::vector<APNGFrame>& frames, unsigned int first, 
   unsigned int bpp = (coltype == 6) ? 4 : (coltype == 2) ? 3 : (coltype == 4) ? 2 : 1;
   unsigned int has_tcolor = (coltype >= 4 || (coltype <= 2 && trnssize)) ? 1 : 0;
   unsigned int tcolor = 0;
-  unsigned int rowbytes  = width * bpp;
-  unsigned int imagesize = rowbytes * height;
+  size_t rowbytes_sz = 0;
+  size_t imagesize_sz = 0;
+  size_t rowsbuf_sz = 0;
+  size_t zbuf_size_sz = 0;
+  if (!compute_image_layout(width, height, bpp, &rowbytes_sz, &imagesize_sz))
+    return 1;
+  if (!checked_add_size(rowbytes_sz, 1, &rowsbuf_sz) || !checked_mul_size(rowsbuf_sz, (size_t)height, &rowsbuf_sz))
+    return 1;
+  if (!checked_add_size(rowsbuf_sz, ((rowsbuf_sz + 7) >> 3), &zbuf_size_sz) ||
+      !checked_add_size(zbuf_size_sz, ((rowsbuf_sz + 63) >> 6), &zbuf_size_sz) ||
+      !checked_add_size(zbuf_size_sz, 11, &zbuf_size_sz))
+    return 1;
+  if (rowbytes_sz > (size_t)UINT_MAX || imagesize_sz > (size_t)UINT_MAX || rowsbuf_sz > (size_t)UINT_MAX || zbuf_size_sz > (size_t)INT_MAX)
+    return 1;
+  unsigned int rowbytes = (unsigned int)rowbytes_sz;
+  unsigned int imagesize = (unsigned int)imagesize_sz;
 
   unsigned char * temp  = new unsigned char[imagesize];
   unsigned char * over1 = new unsigned char[imagesize];
   unsigned char * over2 = new unsigned char[imagesize];
   unsigned char * over3 = new unsigned char[imagesize];
   unsigned char * rest  = new unsigned char[imagesize];
-  unsigned char * rows  = new unsigned char[(rowbytes + 1) * height];
+  unsigned char * rows  = new unsigned char[rowsbuf_sz];
 
   if (trnssize)
   {
@@ -1312,7 +1555,17 @@ int save_apng(char * szOut, std::vector<APNGFrame>& frames, unsigned int first, 
     png_save_uint_32(buf_acTL, num_frames-first);
     png_save_uint_32(buf_acTL + 4, loops);
 
-    fwrite(header, 1, 8, f);
+    if (fwrite(header, 1, 8, f) != 8)
+    {
+      fclose(f);
+      delete[] temp;
+      delete[] over1;
+      delete[] over2;
+      delete[] over3;
+      delete[] rest;
+      delete[] rows;
+      return 1;
+    }
 
     write_chunk(f, "IHDR", buf_IHDR, 13);
 
@@ -1331,16 +1584,37 @@ int save_apng(char * szOut, std::vector<APNGFrame>& frames, unsigned int first, 
     op_zstream1.zalloc = Z_NULL;
     op_zstream1.zfree = Z_NULL;
     op_zstream1.opaque = Z_NULL;
-    deflateInit2(&op_zstream1, Z_BEST_SPEED+1, 8, 15, 8, Z_DEFAULT_STRATEGY);
+    if (deflateInit2(&op_zstream1, Z_BEST_SPEED+1, 8, 15, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+    {
+      fclose(f);
+      delete[] temp;
+      delete[] over1;
+      delete[] over2;
+      delete[] over3;
+      delete[] rest;
+      delete[] rows;
+      return 1;
+    }
 
     op_zstream2.data_type = Z_BINARY;
     op_zstream2.zalloc = Z_NULL;
     op_zstream2.zfree = Z_NULL;
     op_zstream2.opaque = Z_NULL;
-    deflateInit2(&op_zstream2, Z_BEST_SPEED+1, 8, 15, 8, Z_FILTERED);
+    if (deflateInit2(&op_zstream2, Z_BEST_SPEED+1, 8, 15, 8, Z_FILTERED) != Z_OK)
+    {
+      deflateEnd(&op_zstream1);
+      fclose(f);
+      delete[] temp;
+      delete[] over1;
+      delete[] over2;
+      delete[] over3;
+      delete[] rest;
+      delete[] rows;
+      return 1;
+    }
 
-    idat_size = (rowbytes + 1) * height;
-    zbuf_size = idat_size + ((idat_size + 7) >> 3) + ((idat_size + 63) >> 6) + 11;
+    idat_size = (unsigned int)rowsbuf_sz;
+    zbuf_size = (unsigned int)zbuf_size_sz;
 
     zbuf = new unsigned char[zbuf_size];
     op_zbuf1 = new unsigned char[zbuf_size];
@@ -1368,7 +1642,27 @@ int save_apng(char * szOut, std::vector<APNGFrame>& frames, unsigned int first, 
     for (j=0; j<6; j++)
       op[j].valid = 0;
     deflate_rect_op(frames[0].p, x0, y0, w0, h0, bpp, rowbytes, zbuf_size, 0);
-    deflate_rect_fin(deflate_method, iter, zbuf, &zsize, bpp, rowbytes, rows, zbuf_size, 0);
+    if (!deflate_rect_fin(deflate_method, iter, zbuf, &zsize, bpp, rowbytes, rows, zbuf_size, 0))
+    {
+      fclose(f);
+      delete[] zbuf;
+      delete[] op_zbuf1;
+      delete[] op_zbuf2;
+      delete[] row_buf;
+      delete[] sub_row;
+      delete[] up_row;
+      delete[] avg_row;
+      delete[] paeth_row;
+      deflateEnd(&op_zstream1);
+      deflateEnd(&op_zstream2);
+      delete[] temp;
+      delete[] over1;
+      delete[] over2;
+      delete[] over3;
+      delete[] rest;
+      delete[] rows;
+      return 1;
+    }
 
     if (first)
     {
@@ -1378,7 +1672,27 @@ int save_apng(char * szOut, std::vector<APNGFrame>& frames, unsigned int first, 
       for (j=0; j<6; j++)
         op[j].valid = 0;
       deflate_rect_op(frames[1].p, x0, y0, w0, h0, bpp, rowbytes, zbuf_size, 0);
-      deflate_rect_fin(deflate_method, iter, zbuf, &zsize, bpp, rowbytes, rows, zbuf_size, 0);
+      if (!deflate_rect_fin(deflate_method, iter, zbuf, &zsize, bpp, rowbytes, rows, zbuf_size, 0))
+      {
+        fclose(f);
+        delete[] zbuf;
+        delete[] op_zbuf1;
+        delete[] op_zbuf2;
+        delete[] row_buf;
+        delete[] sub_row;
+        delete[] up_row;
+        delete[] avg_row;
+        delete[] paeth_row;
+        deflateEnd(&op_zstream1);
+        deflateEnd(&op_zstream2);
+        delete[] temp;
+        delete[] over1;
+        delete[] over2;
+        delete[] over3;
+        delete[] rest;
+        delete[] rows;
+        return 1;
+      }
     }
 
     for (i=first; i<num_frames-1; i++)
@@ -1461,7 +1775,27 @@ int save_apng(char * szOut, std::vector<APNGFrame>& frames, unsigned int first, 
       h0 = op[op_best].h;
       bop = op_best & 1;
 
-      deflate_rect_fin(deflate_method, iter, zbuf, &zsize, bpp, rowbytes, rows, zbuf_size, op_best);
+      if (!deflate_rect_fin(deflate_method, iter, zbuf, &zsize, bpp, rowbytes, rows, zbuf_size, op_best))
+      {
+        fclose(f);
+        delete[] zbuf;
+        delete[] op_zbuf1;
+        delete[] op_zbuf2;
+        delete[] row_buf;
+        delete[] sub_row;
+        delete[] up_row;
+        delete[] avg_row;
+        delete[] paeth_row;
+        deflateEnd(&op_zstream1);
+        deflateEnd(&op_zstream2);
+        delete[] temp;
+        delete[] over1;
+        delete[] over2;
+        delete[] over3;
+        delete[] rest;
+        delete[] rows;
+        return 1;
+      }
     }
 
     if (num_frames > 1)
@@ -1498,6 +1832,12 @@ int save_apng(char * szOut, std::vector<APNGFrame>& frames, unsigned int first, 
   else
   {
     printf( "Error: couldn't open file for writing\n" );
+    delete[] temp;
+    delete[] over1;
+    delete[] over2;
+    delete[] over3;
+    delete[] rest;
+    delete[] rows;
     return 1;
   }
 
@@ -1514,15 +1854,22 @@ int save_apng(char * szOut, std::vector<APNGFrame>& frames, unsigned int first, 
 
 int main(int argc, char** argv)
 {
-  char   szInput[256];
-  char   szOut[256];
+  std::string szInput;
+  std::string szOut;
   char * szOpt;
-  char * szExt;
   std::vector<APNGFrame> frames;
   unsigned int first, loops, coltype;
   int    deflate_method = 0;
   int    iter = 15;
   int    disableImageQuant = 0;
+  int    liqSpeed = 4;
+  int    liqMaxColors = 256;
+  int    liqPosterization = 0;
+  float  liqDither = 1.0f;
+  int    liqMinQuality = 50;
+  int    liqMaxQuality = 100;
+  unsigned int liqThreads = 0;
+  unsigned int mtThreads = 1;
 
   printf("\nAPNG Optimizer 1.4");
 
@@ -1533,19 +1880,79 @@ int main(int argc, char** argv)
            "-z1  : 7zip compression \n"
            "-z2  : zopfli compression\n"
            "-i## : number of iterations, default -i%d\n"
-		   "-d## : disable imagequant compress 0 or 1, default 0 -d%d\n", iter, disableImageQuant);
+           "-d## : disable imagequant compress 0 or 1, default 0 -d%d\n"
+           "--liq-speed=N     : imagequant speed (1..10), default %d\n"
+           "--liq-colors=N    : imagequant max colors (2..256), default %d\n"
+           "--liq-posterize=N : imagequant posterization bits (0..4), default %d\n"
+           "--liq-dither=F    : imagequant dithering (0..1), default %.2f\n"
+           "--liq-quality=A-B : imagequant quality range (0..100), default %d-%d\n"
+           "--liq-threads=N   : set RAYON_NUM_THREADS for imagequant\n"
+           "--mt=N            : apngopt local threads for independent stages\n",
+           iter, disableImageQuant, liqSpeed, liqMaxColors, liqPosterization, liqDither, liqMinQuality, liqMaxQuality);
     return 1;
   }
-
-  szInput[0] = 0;
-  szOut[0] = 0;
 
   for (int i=1; i<argc; i++)
   {
     szOpt = argv[i];
 	printf("\n szOpt: %s\n", szOpt);
 	/* szOpt[0] == '/' || */
-    if (szOpt[0] == '-')
+    if (strncmp(szOpt, "--", 2) == 0)
+    {
+      if (strncmp(szOpt, "--liq-speed=", 12) == 0)
+      {
+        liqSpeed = atoi(szOpt + 12);
+        if (liqSpeed < 1) liqSpeed = 1;
+        if (liqSpeed > 10) liqSpeed = 10;
+      }
+      else if (strncmp(szOpt, "--liq-colors=", 13) == 0)
+      {
+        liqMaxColors = atoi(szOpt + 13);
+        if (liqMaxColors < 2) liqMaxColors = 2;
+        if (liqMaxColors > 256) liqMaxColors = 256;
+      }
+      else if (strncmp(szOpt, "--liq-posterize=", 16) == 0)
+      {
+        liqPosterization = atoi(szOpt + 16);
+        if (liqPosterization < 0) liqPosterization = 0;
+        if (liqPosterization > 4) liqPosterization = 4;
+      }
+      else if (strncmp(szOpt, "--liq-dither=", 13) == 0)
+      {
+        liqDither = (float)atof(szOpt + 13);
+        if (liqDither < 0.0f) liqDither = 0.0f;
+        if (liqDither > 1.0f) liqDither = 1.0f;
+      }
+      else if (strncmp(szOpt, "--liq-quality=", 14) == 0)
+      {
+        const char *q = szOpt + 14;
+        const char *dash = strchr(q, '-');
+        if (dash)
+        {
+          liqMinQuality = atoi(q);
+          liqMaxQuality = atoi(dash + 1);
+          if (liqMinQuality < 0) liqMinQuality = 0;
+          if (liqMinQuality > 100) liqMinQuality = 100;
+          if (liqMaxQuality < 0) liqMaxQuality = 0;
+          if (liqMaxQuality > 100) liqMaxQuality = 100;
+          if (liqMinQuality > liqMaxQuality)
+            liqMinQuality = liqMaxQuality;
+        }
+      }
+      else if (strncmp(szOpt, "--liq-threads=", 14) == 0)
+      {
+        int t = atoi(szOpt + 14);
+        if (t > 0)
+          liqThreads = (unsigned int)t;
+      }
+      else if (strncmp(szOpt, "--mt=", 5) == 0)
+      {
+        int t = atoi(szOpt + 5);
+        if (t > 0)
+          mtThreads = (unsigned int)t;
+      }
+    }
+    else if (szOpt[0] == '-')
     {
       if (szOpt[1] == 'z' || szOpt[1] == 'Z')
       {
@@ -1568,13 +1975,13 @@ int main(int argc, char** argv)
       }
     }
     else
-    if (szInput[0] == 0)
-      strcpy(szInput, szOpt);
+    if (szInput.empty())
+      szInput = szOpt;
     else
-    if (szOut[0] == 0)
-      strcpy(szOut, szOpt);
+    if (szOut.empty())
+      szOut = szOpt;
   }
-  printf(" input file: %s\n", szInput);
+  printf(" input file: %s\n", szInput.c_str());
   if (deflate_method == 0)
     printf(" using ZLIB\n\n");
   else if (deflate_method == 1)
@@ -1582,30 +1989,50 @@ int main(int argc, char** argv)
   else if (deflate_method == 2)
     printf(" using ZOPFLI with %d iterations\n\n", iter);
 
-  if (szOut[0] == 0)
+  if (szOut.empty())
   {
-    strcpy(szOut, szInput);
-    if ((szExt = strrchr(szOut, '.')) != NULL) *szExt = 0;
-    strcat(szOut, "_opt.png");
+    szOut = szInput;
+    size_t dot = szOut.find_last_of('.');
+    if (dot != std::string::npos)
+      szOut.erase(dot);
+    szOut += "_opt.png";
   }
-  printf(" output file: %s\n", szOut);
+  printf(" output file: %s\n", szOut.c_str());
 
-  int res = load_apng(szInput, frames, first, loops);
+  int res = load_apng(szInput.c_str(), frames, first, loops);
   if (res < 0)
   {
-    printf("load_apng() failed: '%s'\n", szInput);
+    printf("load_apng() failed: '%s'\n", szInput.c_str());
     return 1;
   }
 
-  optim_dirty(frames);
+  optim_dirty_mt(frames, mtThreads);
   optim_duplicates(frames, first);
   
   if (disableImageQuant > 0)
     optim_downconvert(frames, coltype);
   else
-	optim_image(frames, coltype, 50, 100);
+  {
+    if (!set_imagequant_thread_env(liqThreads))
+      printf("warning: unable to set RAYON_NUM_THREADS=%u\n", liqThreads);
+    if (!optim_image(frames, coltype, liqMinQuality, liqMaxQuality, liqSpeed, liqMaxColors, liqPosterization, liqDither))
+    {
+      printf("warning: imagequant path failed, using downconvert fallback\n");
+      optim_downconvert(frames, coltype);
+    }
+  }
 
-  save_apng(szOut, frames, first, loops, coltype, deflate_method, iter);
+  if (save_apng(szOut.c_str(), frames, first, loops, coltype, deflate_method, iter) != 0)
+  {
+    printf("save_apng() failed: '%s'\n", szOut.c_str());
+    for (size_t j=0; j<frames.size(); j++)
+    {
+      delete[] frames[j].rows;
+      delete[] frames[j].p;
+    }
+    frames.clear();
+    return 1;
+  }
 
   for (size_t j=0; j<frames.size(); j++)
   {

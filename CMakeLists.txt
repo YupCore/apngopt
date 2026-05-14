@@ -97,9 +97,9 @@ endif()
 if(APNGOPT_ENABLE_IMAGEQUANT)
   find_program(CARGO_EXECUTABLE cargo REQUIRED)
 
-  set(APNGOPT_IMAGEQUANT_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/vendor/libimagequant/imagequant-sys/Cargo.toml")
+  set(APNGOPT_IMAGEQUANT_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/vendor/libimagequant/Cargo.toml")
   set(APNGOPT_IMAGEQUANT_TARGET_DIR "${CMAKE_BINARY_DIR}/imagequant-target")
-  set(APNGOPT_IMAGEQUANT_CARGO_ARGS build --manifest-path ${APNGOPT_IMAGEQUANT_MANIFEST} --release)
+  set(APNGOPT_IMAGEQUANT_CARGO_ARGS build --manifest-path ${APNGOPT_IMAGEQUANT_MANIFEST} -p imagequant-sys --release)
   set(APNGOPT_IMAGEQUANT_OUTPUT_DIR "${APNGOPT_IMAGEQUANT_TARGET_DIR}/release")
 
   if(WIN32)
@@ -119,7 +119,7 @@ if(APNGOPT_ENABLE_IMAGEQUANT)
       CARGO_TARGET_DIR=${APNGOPT_IMAGEQUANT_TARGET_DIR}
       ${CARGO_EXECUTABLE} ${APNGOPT_IMAGEQUANT_CARGO_ARGS}
     BYPRODUCTS ${APNGOPT_IMAGEQUANT_LIB}
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/vendor/libimagequant/imagequant-sys
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/vendor/libimagequant
     COMMENT "Building vendored imagequant-sys with Cargo"
     VERBATIM
   )
